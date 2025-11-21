@@ -1,633 +1,920 @@
 """
-Interactive Time-Series Segmentation, Deletion and Annotation Tool
-===============================================================
+Scientific Time-Series Annotation & Cleaning Workbench
+------------------------------------------------------
 
-This application provides an interactive graphical interface built
-using PyQt6 and pyqtgraph for exploring and cleaning time‐series
-datasets sampled at 120 Hz. Users can load CSV files that follow
-the structure of the provided example, select which numeric channels
-to view, mark segments on the timeline for deletion or annotation,
-and save the cleaned data and annotation metadata. Deleted
-segments cause the timeline to collapse and the `normalized_time`
-column is recomputed based on the 120 Hz sampling rate. Annotated
-segments are preserved in the data but saved separately as JSON.
+This application targets gaze/kinematics/IMU CSV data and provides
+no-code tools for loading, segmenting, annotating, filtering, and
+exporting publication-ready figures. It includes a project concept,
+undo/redo, 2D+3D synchronized visualization, coordinate frame helpers,
+and a minimal plugin/recipe system.
 
-The application is comprised of four core components:
+Dependencies
+------------
+pip install PyQt6 pyqtgraph pandas numpy scipy
 
-* DataController – manages loading, cleaning, annotations, and undo/redo.
-* SegmentManager – tracks the current selection and stored segments.
-* PlotManager – responsible for plotting multiple channels and visual
-  feedback for markers, deletions, and annotations.
-* MainWindow – constructs the GUI, binds controls to actions and
-  coordinates interactions between components.
-
-This file contains the full implementation and can be run as a
-standalone script. Dependencies include PyQt6, pyqtgraph, pandas and
-NumPy. Make sure these packages are installed in your environment.
+Run
+---
+python main.py
 """
+from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any
+import sys
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
+import pyqtgraph.exporters  # noqa: F401 - module provides exporters used dynamically
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from data_model import AnnotationSegment, DataModel
+from dialogs import (
+    AnnotationTable,
+    ExportFigureDialog,
+    FilterDialog,
+    FrameManagerDialog,
+    MappingDialog,
+    PreferencesDialog,
+    ShortcutDialog,
+)
+from filter_engine import FilterEngine
+from plot2d import PlotController2D
+from plot3d import PlotController3D
+from plugin_system import PluginManager
+from project_manager import ProjectManager
 
 
-###############################################################################
-# Utility classes
-###############################################################################
+class ChannelManagerWidget(QtWidgets.QWidget):
+    """Panel listing time/metadata/signals with show/hide checkboxes."""
 
-@dataclass
-class Annotation:
-    """Represents an annotated segment."""
-    start: float
-    end: float
-    label: str
+    channelToggled = QtCore.pyqtSignal()
 
-
-@dataclass
-class Deletion:
-    """Represents a deleted segment."""
-    start: float
-    end: float
-
-
-class DataController(QtCore.QObject):
-    """Manages the dataset, deletion and annotation metadata and undo/redo stack."""
-
-    dataChanged = QtCore.pyqtSignal()
-    annotationsChanged = QtCore.pyqtSignal()
-    statusMessage = QtCore.pyqtSignal(str)
-
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.original_df: Optional[pd.DataFrame] = None
-        self.df: Optional[pd.DataFrame] = None
-        self.metadata_columns: List[str] = []
-        self.signal_columns: List[str] = []
-        self.deletions: List[Deletion] = []
-        self.annotations: List[Annotation] = []
-        # Undo/redo stacks: each element stores (df_copy, deletions_copy, annotations_copy)
-        self._undo_stack: List[Tuple[pd.DataFrame, List[Deletion], List[Annotation]]] = []
-        self._redo_stack: List[Tuple[pd.DataFrame, List[Deletion], List[Annotation]]] = []
-        self.sample_rate: float = 120.0
+        layout = QtWidgets.QVBoxLayout(self)
+        self.time_list = QtWidgets.QListWidget()
+        self.meta_list = QtWidgets.QListWidget()
+        self.signal_container = QtWidgets.QScrollArea()
+        self.signal_container.setWidgetResizable(True)
+        self.signal_widget = QtWidgets.QWidget()
+        self.signal_layout = QtWidgets.QVBoxLayout(self.signal_widget)
+        self.signal_layout.setContentsMargins(0, 0, 0, 0)
+        self.signal_container.setWidget(self.signal_widget)
+        layout.addWidget(QtWidgets.QLabel("Time columns"))
+        layout.addWidget(self.time_list)
+        layout.addWidget(QtWidgets.QLabel("Metadata columns"))
+        layout.addWidget(self.meta_list)
+        layout.addWidget(QtWidgets.QLabel("Signals"))
+        layout.addWidget(self.signal_container, 1)
+        self.presets_combo = QtWidgets.QComboBox()
+        self.presets_combo.setEditable(True)
+        self.save_preset_btn = QtWidgets.QPushButton("Save preset")
+        p_layout = QtWidgets.QHBoxLayout()
+        p_layout.addWidget(self.presets_combo)
+        p_layout.addWidget(self.save_preset_btn)
+        layout.addLayout(p_layout)
+        self.presets: Dict[str, List[str]] = {}
+        self.save_preset_btn.clicked.connect(self.save_preset)
+        self.presets_combo.currentIndexChanged.connect(self.apply_preset)
 
-    def load_csv(self, path: str) -> None:
-        """Load a CSV file and classify columns into metadata vs signal."""
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: {path}")
-        df = pd.read_csv(path)
-        # Replace missing values with NaN explicitly
-        df = df.replace({"": np.nan, "NaN": np.nan, "nan": np.nan})
-        # Determine metadata columns: non-numeric columns (object type)
-        metadata_cols = []
-        signal_cols = []
-        for col in df.columns:
-            if col == "normalized_time":
-                continue
-            if pd.api.types.is_numeric_dtype(df[col]):
-                signal_cols.append(col)
-            else:
-                metadata_cols.append(col)
-        # Save state
-        self.original_df = df.copy()
-        self.df = df.copy()
-        self.metadata_columns = metadata_cols
-        self.signal_columns = signal_cols
-        self.deletions = []
-        self.annotations = []
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self.statusMessage.emit(f"Loaded {os.path.basename(path)} with {len(df)} rows and {len(df.columns)} columns")
-        self.dataChanged.emit()
+    def populate(self, time_cols: List[str], meta_cols: List[str], signal_cols: Dict[str, List[str]]) -> None:
+        self.time_list.clear()
+        self.meta_list.clear()
+        for c in time_cols:
+            self.time_list.addItem(c)
+        for c in meta_cols:
+            self.meta_list.addItem(c)
+        # clear signals
+        for i in reversed(range(self.signal_layout.count())):
+            w = self.signal_layout.itemAt(i).widget()
+            if w:
+                w.setParent(None)
+        # grouped signal checkboxes
+        for grp, cols in signal_cols.items():
+            lbl = QtWidgets.QLabel(f"{grp}")
+            lbl.setStyleSheet("font-weight:bold;")
+            self.signal_layout.addWidget(lbl)
+            for col in cols:
+                cb = QtWidgets.QCheckBox(col)
+                cb.setChecked(grp != "Other" and len(self.get_checked_channels()) < 6)
+                cb.stateChanged.connect(self.channelToggled)
+                self.signal_layout.addWidget(cb)
+        self.signal_layout.addStretch(1)
 
-    def get_current_df(self) -> pd.DataFrame:
-        """Return a copy of the current DataFrame."""
-        return self.df.copy() if self.df is not None else pd.DataFrame()
+    def get_checked_channels(self) -> List[str]:
+        channels: List[str] = []
+        for i in range(self.signal_layout.count()):
+            w = self.signal_layout.itemAt(i).widget()
+            if isinstance(w, QtWidgets.QCheckBox) and w.isChecked():
+                channels.append(w.text())
+        return channels
 
-    def push_state(self) -> None:
-        """Push the current state onto the undo stack and clear the redo stack."""
-        if self.df is None:
+    def save_preset(self) -> None:
+        name = self.presets_combo.currentText().strip()
+        if not name:
             return
-        # Deep copy the DataFrame and metadata lists
-        self._undo_stack.append((self.df.copy(), list(self.deletions), list(self.annotations)))
-        self._redo_stack.clear()
+        self.presets[name] = self.get_checked_channels()
+        if self.presets_combo.findText(name) == -1:
+            self.presets_combo.addItem(name)
 
-    def undo(self) -> None:
-        """Undo the last operation."""
-        if not self._undo_stack:
-            self.statusMessage.emit("Nothing to undo")
+    def apply_preset(self) -> None:
+        name = self.presets_combo.currentText()
+        chans = self.presets.get(name, [])
+        if not chans:
             return
-        # Push current state to redo before reverting
-        if self.df is not None:
-            self._redo_stack.append((self.df.copy(), list(self.deletions), list(self.annotations)))
-        df, dels, anns = self._undo_stack.pop()
-        self.df = df
-        self.deletions = dels
-        self.annotations = anns
-        self.dataChanged.emit()
-        self.annotationsChanged.emit()
-        self.statusMessage.emit("Undo last action")
-
-    def redo(self) -> None:
-        """Redo the last undone operation."""
-        if not self._redo_stack:
-            self.statusMessage.emit("Nothing to redo")
-            return
-        if self.df is not None:
-            self._undo_stack.append((self.df.copy(), list(self.deletions), list(self.annotations)))
-        df, dels, anns = self._redo_stack.pop()
-        self.df = df
-        self.deletions = dels
-        self.annotations = anns
-        self.dataChanged.emit()
-        self.annotationsChanged.emit()
-        self.statusMessage.emit("Redo last undone action")
-
-    def delete_segment(self, start: float, end: float) -> None:
-        """Delete rows within [start, end] and collapse time."""
-        if self.df is None:
-            return
-        if start >= end:
-            self.statusMessage.emit("Invalid deletion range")
-            return
-        # Push state to undo stack
-        self.push_state()
-        # Perform deletion
-        mask = (self.df["normalized_time"] < start) | (self.df["normalized_time"] > end)
-        new_df = self.df.loc[mask].reset_index(drop=True)
-        # Recompute normalized_time
-        n = len(new_df)
-        new_df["normalized_time"] = np.arange(n) / self.sample_rate
-        self.df = new_df
-        # Record deletion
-        self.deletions.append(Deletion(start=start, end=end))
-        self.dataChanged.emit()
-        self.annotationsChanged.emit()
-        self.statusMessage.emit(f"Deleted segment {start:.3f}–{end:.3f}s")
-
-    def annotate_segment(self, start: float, end: float, label: str) -> None:
-        """Record an annotation without altering the data."""
-        if self.df is None:
-            return
-        if start >= end:
-            self.statusMessage.emit("Invalid annotation range")
-            return
-        # Push state to undo stack so that annotations can be undone
-        self.push_state()
-        self.annotations.append(Annotation(start=start, end=end, label=label))
-        self.annotationsChanged.emit()
-        self.statusMessage.emit(f"Annotated segment {start:.3f}–{end:.3f}s as '{label}'")
-
-    def save_cleaned_csv(self, path: str) -> None:
-        """Save the current DataFrame to a CSV file."""
-        if self.df is None:
-            self.statusMessage.emit("No data to save")
-            return
-        self.df.to_csv(path, index=False)
-        self.statusMessage.emit(f"Saved cleaned data to {path}")
-
-    def save_annotations(self, path: str) -> None:
-        """Save annotations and deletions to JSON."""
-        data = {
-            "annotations": [ann.__dict__ for ann in self.annotations],
-            "deletions": [del_.__dict__ for del_ in self.deletions],
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        self.statusMessage.emit(f"Saved annotations to {path}")
-
-    def load_annotations(self, path: str) -> None:
-        """Load annotations and deletions from a JSON file and apply to current data."""
-        if not os.path.isfile(path):
-            self.statusMessage.emit(f"Annotation file not found: {path}")
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        anns = data.get("annotations", [])
-        dels = data.get("deletions", [])
-        # Reset current state and reapply
-        if self.original_df is not None:
-            self.df = self.original_df.copy()
-            self.deletions = []
-            self.annotations = []
-            # Apply deletions first
-            for d in sorted(dels, key=lambda x: (x["start"], x["end"])):
-                self.delete_segment(d["start"], d["end"])
-            # Apply annotations after deletions
-            for a in anns:
-                self.annotate_segment(a["start"], a["end"], a["label"])
-            self.statusMessage.emit(f"Loaded annotations from {path}")
-        else:
-            self.statusMessage.emit("No data loaded; cannot apply annotations")
+        for i in range(self.signal_layout.count()):
+            w = self.signal_layout.itemAt(i).widget()
+            if isinstance(w, QtWidgets.QCheckBox):
+                w.setChecked(w.text() in chans)
 
 
-class SegmentManager(QtCore.QObject):
-    """Handles temporary marker positions for segment selection."""
+class OperationHistoryWidget(QtWidgets.QListWidget):
+    def push(self, text: str) -> None:
+        self.addItem(text)
+        self.scrollToBottom()
 
-    selectionChanged = QtCore.pyqtSignal(float, float)
 
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+class ProjectPanel(QtWidgets.QWidget):
+    trialSelected = QtCore.pyqtSignal(str)
+
+    def __init__(self, project: ProjectManager, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.start: Optional[float] = None
-        self.end: Optional[float] = None
+        self.project = project
+        layout = QtWidgets.QVBoxLayout(self)
+        btns = QtWidgets.QHBoxLayout()
+        self.add_btn = QtWidgets.QPushButton("Add trial")
+        self.save_btn = QtWidgets.QPushButton("Save project")
+        btns.addWidget(self.add_btn)
+        btns.addWidget(self.save_btn)
+        layout.addLayout(btns)
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Path", "Participant", "Condition", "Status"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+        self.add_btn.clicked.connect(self.add_trial)
+        self.save_btn.clicked.connect(self.project.save)
+        self.table.cellDoubleClicked.connect(self._emit_selection)
 
-    def set_marker(self, time_point: float) -> None:
-        """Assign start or end marker based on what is currently empty."""
-        if self.start is None:
-            self.start = time_point
-        elif self.end is None:
-            self.end = time_point
-        else:
-            # Both markers already set; reset and set new start
-            self.start = time_point
-            self.end = None
-        if self.start is not None and self.end is not None:
-            # Emit selection in sorted order
-            s, e = sorted([self.start, self.end])
-            self.selectionChanged.emit(s, e)
+    def refresh(self) -> None:
+        self.table.setRowCount(len(self.project.trials))
+        for row, t in enumerate(self.project.trials):
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(t.path))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(t.participant))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(t.condition))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(t.status))
 
-    def clear(self) -> None:
-        self.start = None
-        self.end = None
-        self.selectionChanged.emit(float('nan'), float('nan'))
+    def add_trial(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add trial CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        participant, _ = QtWidgets.QInputDialog.getText(self, "Participant", "ID (optional)")
+        condition, _ = QtWidgets.QInputDialog.getText(self, "Condition", "Condition (optional)")
+        self.project.add_trial(path, participant, condition)
+        self.refresh()
+
+    def _emit_selection(self, row: int, col: int) -> None:
+        if 0 <= row < len(self.project.trials):
+            self.trialSelected.emit(self.project.trials[row].path)
+
+    def selected_trials(self) -> List[str]:
+        paths: List[str] = []
+        for idx in {i.row() for i in self.table.selectedIndexes()}:
+            if 0 <= idx < len(self.project.trials):
+                paths.append(self.project.trials[idx].path)
+        return paths
 
 
-class PlotManager(QtCore.QObject):
-    """Handles plotting of signals and visual feedback on a pyqtgraph canvas."""
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+class GuidedWizard(QtWidgets.QWizard):
+    """Simple wizard to walk through basic steps."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.plot_widget = pg.GraphicsLayoutWidget()
-        self.plots: List[pg.PlotItem] = []
-        self.data: pd.DataFrame = pd.DataFrame()
-        self.channels: List[str] = []
-        self.marker_lines: Tuple[Optional[pg.InfiniteLine], Optional[pg.InfiniteLine]] = (None, None)
-        self.annotation_regions: List[pg.LinearRegionItem] = []
-        self.deletion_regions: List[pg.LinearRegionItem] = []
-        # Colours for annotations and deletions
-        self.annotation_brush = pg.mkBrush(QtGui.QColor(200, 200, 255, 100))  # light blue
-        self.deletion_brush = pg.mkBrush(QtGui.QColor(255, 200, 200, 150))   # light red
+        self.setWindowTitle("Guided Workflow")
+        self.addPage(self._page("Step 1: Load file", "Use File → Open CSV to load a trial."))
+        self.addPage(self._page("Step 2: Pick channels", "Use the Channel Manager dock to toggle signals."))
+        self.addPage(self._page("Step 3: Clean artefacts", "Drag or click to select a segment, then D/M/A."))
+        self.addPage(self._page("Step 4: Apply smoothing", "Tools → Filters to smooth gaze/heading."))
+        self.addPage(self._page("Step 5: Export", "File → Export cleaned data and figures."))
 
-    def set_data(self, df: pd.DataFrame) -> None:
-        """Set the dataset for plotting."""
-        self.data = df.copy()
-        self.update_plots()
-
-    def set_channels(self, channels: List[str]) -> None:
-        """Update the list of channels to display."""
-        self.channels = channels
-        self.update_plots()
-
-    def update_plots(self) -> None:
-        """Recreate plots according to current data and channel selection."""
-        # Clear existing layout
-        for p in self.plots:
-            p.clear()
-            self.plot_widget.removeItem(p)
-        self.plots.clear()
-        if self.data.empty or not self.channels:
-            return
-        time = self.data["normalized_time"].values
-        layout = self.plot_widget
-        # Add one plot per channel
-        for idx, ch in enumerate(self.channels):
-            p = layout.addPlot(row=idx, col=0)
-            p.clear()
-            p.plot(time, self.data[ch].values, pen=pg.mkPen())
-            p.showGrid(x=True, y=True)
-            p.setLabel("left", ch)
-            if idx == len(self.channels) - 1:
-                p.setLabel("bottom", "Time (s)")
-            # share x-axis
-            if idx > 0:
-                p.setXLink(self.plots[0])
-            self.plots.append(p)
-        # Reset marker references and region visuals
-        self.marker_lines = (None, None)
-        self.clear_regions()
-
-    def clear_regions(self) -> None:
-        """Remove all shaded regions from plots."""
-        # Remove existing annotation and deletion regions
-        for region in self.annotation_regions + self.deletion_regions:
-            for plot in self.plots:
-                try:
-                    plot.removeItem(region)
-                except Exception:
-                    pass
-        self.annotation_regions.clear()
-        self.deletion_regions.clear()
-
-    def draw_marker(self, idx: int, time_point: float) -> None:
-        """Draw a vertical marker line on all plots. idx=0 for start, idx=1 for end."""
-        if not self.plots:
-            return
-        # Create or update the infinite line
-        line = self.marker_lines[idx]
-        if line is None:
-            line = pg.InfiniteLine(pos=time_point, angle=90, pen=pg.mkPen('b'))
-            for p in self.plots:
-                p.addItem(line)
-        else:
-            line.setPos(time_point)
-        markers = list(self.marker_lines)
-        markers[idx] = line
-        self.marker_lines = tuple(markers)
-
-    def clear_markers(self) -> None:
-        """Remove marker lines from the plots."""
-        for line in self.marker_lines:
-            if line is not None:
-                for p in self.plots:
-                    try:
-                        p.removeItem(line)
-                    except Exception:
-                        pass
-        self.marker_lines = (None, None)
-
-    def update_regions(self, annotations: List[Annotation], deletions: List[Deletion]) -> None:
-        """Draw shaded regions based on current annotations and deletions."""
-        # Clear any existing regions
-        self.clear_regions()
-        # Draw deletions first
-        for del_seg in deletions:
-            region = pg.LinearRegionItem(values=(del_seg.start, del_seg.end), brush=self.deletion_brush, movable=False)
-            region.setZValue(-10)  # ensure behind data
-            self.deletion_regions.append(region)
-            for p in self.plots:
-                p.addItem(region)
-        # Draw annotations
-        for ann in annotations:
-            region = pg.LinearRegionItem(values=(ann.start, ann.end), brush=self.annotation_brush, movable=False)
-            region.setZValue(-5)
-            region.annot_label = ann.label  # attach label attribute
-            self.annotation_regions.append(region)
-            for p in self.plots:
-                p.addItem(region)
-        # Attach tooltips to annotation regions
-        for region in self.annotation_regions:
-            def make_tooltip(label: str):
-                return lambda: QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), label)
-            region.sigClicked.connect(make_tooltip(region.annot_label))  # type: ignore
+    def _page(self, title: str, text: str) -> QtWidgets.QWizardPage:
+        page = QtWidgets.QWizardPage()
+        page.setTitle(title)
+        lbl = QtWidgets.QLabel(text)
+        lbl.setWordWrap(True)
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.addWidget(lbl)
+        return page
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Main application window with sidebar controls and plotting area."""
-
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Time-Series Segment Editor")
-        self.resize(1200, 800)
-        # Central widget with horizontal layout: sidebar and plot area
+        self.setWindowTitle("Kinematics Annotation Studio")
+        self.resize(1400, 900)
+        self.data_model = DataModel()
+        self.filter_engine = FilterEngine()
+        self.project = ProjectManager()
+        self.plugins = PluginManager()
+        self.frames: Dict[str, Dict] = {"lab": {"parent": "", "offset": 0.0}}
+        self.mapping: Dict[str, Dict[str, str]] = {}
+        self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
+        self.plot2d = PlotController2D()
+        self.plot3d = PlotController3D()
+        self.play_timer = QtCore.QTimer(self)
+        self.play_timer.setInterval(40)
+        self.autosave_timer = QtCore.QTimer(self)
+        self.autosave_timer.setInterval(120000)
+        self.play_speed = 1.0
+        self.snap_to_index = True
+        self.playing = False
+        self.selection: Tuple[Optional[float], Optional[float]] = (None, None)
+        self._build_ui()
+        self._connect_signals()
+        self.plugins.load_plugins()
+        self.restore_autosave()
+
+    def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QHBoxLayout(central)
-        # Left sidebar
-        self.sidebar = QtWidgets.QWidget()
-        self.sidebar.setMinimumWidth(300)
-        sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(5, 5, 5, 5)
-        layout.addWidget(self.sidebar)
-        # Plot area
-        self.plot_manager = PlotManager()
-        layout.addWidget(self.plot_manager.plot_widget, stretch=1)
-        # Instantiate data controller and segment manager
-        self.data_ctrl = DataController()
-        self.segment_mgr = SegmentManager()
-        # Build sidebar UI
-        self.build_sidebar(sidebar_layout)
-        # Connect signals
-        self.connect_signals()
+        layout = QtWidgets.QVBoxLayout(central)
+        self.toolbar = QtWidgets.QToolBar("Playback", self)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+        self.play_action = QtGui.QAction("Play/Pause", self)
+        self.play_action.setShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space))
+        self.toolbar.addAction(self.play_action)
+        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
+        self.speed_combo.setCurrentText("1x")
+        self.toolbar.addWidget(QtWidgets.QLabel("Speed"))
+        self.toolbar.addWidget(self.speed_combo)
+        self.show_3d_action = QtGui.QAction("Show 3D", self)
+        self.show_3d_action.setCheckable(True)
+        self.show_3d_action.setChecked(False)
+        self.toolbar.addAction(self.show_3d_action)
+        self.cursor_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.cursor_slider.setRange(0, 1000)
+        layout.addWidget(self.cursor_slider)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.plot2d.widget)
+        # 3D container with placeholder text
+        self.gl_container = QtWidgets.QWidget()
+        gl_layout = QtWidgets.QVBoxLayout(self.gl_container)
+        gl_layout.setContentsMargins(0, 0, 0, 0)
+        placeholder = QtWidgets.QLabel("3D view (enable via Tools → 3D mapping)")
+        placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("color: #888;")
+        gl_layout.addWidget(placeholder)
+        gl_layout.addWidget(self.plot3d.view, 1)
+        self.gl_container.setVisible(False)
+        self.splitter.addWidget(self.gl_container)
+        self.splitter.setSizes([1200, 1])
+        layout.addWidget(self.splitter, 1)
+        self.channel_manager = ChannelManagerWidget()
+        self.ann_table = AnnotationTable()
+        self.history_widget = OperationHistoryWidget()
+        self.project_panel = ProjectPanel(self.project)
+        self.ann_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.ann_table.customContextMenuRequested.connect(self._show_annotation_menu)
+        self._add_dock("Channel Manager", self.channel_manager, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
+        self._add_dock("Annotations", self.ann_table, QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
+        self._add_dock("Operation History", self.history_widget, QtCore.Qt.DockWidgetArea.BottomDockWidgetArea)
+        self._add_dock("Project", self.project_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.snap_index_chk = QtWidgets.QCheckBox("Snap to index")
+        self.snap_index_chk.setChecked(True)
+        self.snap_peak_chk = QtWidgets.QCheckBox("Snap to extremum")
+        self.statusBar().addPermanentWidget(self.snap_index_chk)
+        self.statusBar().addPermanentWidget(self.snap_peak_chk)
+        self._build_menus()
 
-    def build_sidebar(self, layout: QtWidgets.QVBoxLayout) -> None:
-        """Assemble the sidebar widgets."""
-        # File operations
-        self.load_btn = QtWidgets.QPushButton("Load CSV…")
-        self.save_btn = QtWidgets.QPushButton("Save Cleaned CSV…")
-        self.save_ann_btn = QtWidgets.QPushButton("Save Annotations…")
-        self.load_ann_btn = QtWidgets.QPushButton("Load Annotations…")
-        layout.addWidget(self.load_btn)
-        layout.addWidget(self.save_btn)
-        layout.addWidget(self.save_ann_btn)
-        layout.addWidget(self.load_ann_btn)
-        # Channel selection
-        layout.addWidget(QtWidgets.QLabel("Channels:"))
-        self.channel_scroll = QtWidgets.QScrollArea()
-        self.channel_scroll.setWidgetResizable(True)
-        self.channel_container = QtWidgets.QWidget()
-        self.channel_layout = QtWidgets.QVBoxLayout(self.channel_container)
-        self.channel_layout.setContentsMargins(0, 0, 0, 0)
-        self.channel_scroll.setWidget(self.channel_container)
-        layout.addWidget(self.channel_scroll, stretch=1)
-        # Segment controls
-        layout.addWidget(QtWidgets.QLabel("Segment Controls:"))
-        # Markers: instructions label
-        self.marker_hint = QtWidgets.QLabel("Click on plot to set start/end. Then choose an action.")
-        self.marker_hint.setWordWrap(True)
-        layout.addWidget(self.marker_hint)
-        # Action buttons
-        self.delete_btn = QtWidgets.QPushButton("Delete Segment")
-        self.annotate_btn = QtWidgets.QPushButton("Annotate Segment")
-        # Annotation label dropdown and text entry
-        self.label_combo = QtWidgets.QComboBox()
-        self.label_combo.setEditable(False)
-        self.label_combo.addItems(["blink", "dropout", "spike", "head-movement artefact"])
-        self.custom_label_edit = QtWidgets.QLineEdit()
-        self.custom_label_edit.setPlaceholderText("Custom label… (leave empty to use selection)")
-        layout.addWidget(QtWidgets.QLabel("Annotation label:"))
-        layout.addWidget(self.label_combo)
-        layout.addWidget(self.custom_label_edit)
-        layout.addWidget(self.annotate_btn)
-        layout.addWidget(self.delete_btn)
-        # Undo/redo and clear
-        self.undo_btn = QtWidgets.QPushButton("Undo")
-        self.redo_btn = QtWidgets.QPushButton("Redo")
-        self.clear_sel_btn = QtWidgets.QPushButton("Clear Selection")
-        layout.addWidget(self.undo_btn)
-        layout.addWidget(self.redo_btn)
-        layout.addWidget(self.clear_sel_btn)
-        # Status box
-        layout.addWidget(QtWidgets.QLabel("Status:"))
-        self.status_box = QtWidgets.QLabel("")
-        self.status_box.setWordWrap(True)
-        self.status_box.setMinimumHeight(40)
-        layout.addWidget(self.status_box)
-        # Spacer
-        layout.addStretch(1)
+    def _add_dock(self, title: str, widget: QtWidgets.QWidget, area: QtCore.Qt.DockWidgetArea) -> None:
+        dock = QtWidgets.QDockWidget(title, self)
+        dock.setWidget(widget)
+        self.addDockWidget(area, dock)
 
-    def connect_signals(self) -> None:
-        """Connect signals between controllers and UI widgets."""
-        # File operations
-        self.load_btn.clicked.connect(self.on_load_csv)
-        self.save_btn.clicked.connect(self.on_save_csv)
-        self.save_ann_btn.clicked.connect(self.on_save_annotations)
-        self.load_ann_btn.clicked.connect(self.on_load_annotations)
-        # Segment actions
-        self.delete_btn.clicked.connect(self.on_delete_segment)
-        self.annotate_btn.clicked.connect(self.on_annotate_segment)
-        self.undo_btn.clicked.connect(self.data_ctrl.undo)
-        self.redo_btn.clicked.connect(self.data_ctrl.redo)
-        self.clear_sel_btn.clicked.connect(self.segment_mgr.clear)
-        # Data controller signals
-        self.data_ctrl.dataChanged.connect(self.on_data_changed)
-        self.data_ctrl.annotationsChanged.connect(self.on_annotations_changed)
-        self.data_ctrl.statusMessage.connect(self.update_status)
-        # Segment manager signals
-        self.segment_mgr.selectionChanged.connect(self.on_selection_changed)
-        # Plot interactions: capture mouse clicks
-        self.plot_manager.plot_widget.scene().sigMouseClicked.connect(self.on_plot_clicked)
+    def _build_menus(self) -> None:
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&File")
+        act = file_menu.addAction("Open CSV…", self.on_open_csv)
+        act.setShortcut(QtGui.QKeySequence("Ctrl+O"))
+        act = file_menu.addAction("Save cleaned CSV…", self.on_save_clean)
+        act.setShortcut(QtGui.QKeySequence("Ctrl+S"))
+        file_menu.addAction("Save annotations…", self.on_save_annotations)
+        file_menu.addAction("Load annotations…", self.on_load_annotations)
+        file_menu.addAction("Export figure…", self.on_export_figure)
+        file_menu.addSeparator()
+        file_menu.addAction("New project…", self.on_new_project)
+        file_menu.addAction("Open project…", self.on_open_project)
+        file_menu.addAction("Save project", self.on_save_project)
+        file_menu.addSeparator()
+        act = file_menu.addAction("Quit", self.close)
+        act.setShortcut(QtGui.QKeySequence("Ctrl+Q"))
+        edit_menu = menubar.addMenu("&Edit")
+        act = edit_menu.addAction("Undo", self.data_model.undo)
+        act.setShortcut(QtGui.QKeySequence("U"))
+        act = edit_menu.addAction("Redo", self.data_model.redo)
+        act.setShortcut(QtGui.QKeySequence("R"))
+        edit_menu.addAction("Preferences…", self.on_preferences)
+        self.tools_menu = menubar.addMenu("&Tools")
+        self.tools_menu.addAction("Filters…", self.on_filters)
+        self.tools_menu.addAction("Coordinate frames…", self.on_frames)
+        self.tools_menu.addAction("3D mapping…", self.on_mapping)
+        self.tools_menu.addAction("Derived frame transform…", self.on_frame_transform)
+        self.tools_menu.addAction("Reload plugins", self._reload_plugins)
+        self.tools_menu.addAction("Save recipe from history…", self.save_recipe)
+        self.tools_menu.addAction("Apply recipe to trials…", self.apply_recipe_to_trials)
+        self.tools_menu.addAction("Guided wizard…", self.on_wizard)
+        self._build_plugin_menu()
+        help_menu = menubar.addMenu("&Help")
+        help_menu.addAction("Shortcuts", self.on_shortcuts)
+        help_menu.addAction("About", lambda: QtWidgets.QMessageBox.information(self, "About", "Time-Series Annotation Studio"))
 
-    def on_load_csv(self) -> None:
-        """Handle loading of a CSV file via dialog."""
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open CSV file", "", "CSV files (*.csv)")
-        if path:
-            try:
-                self.data_ctrl.load_csv(path)
-                # Populate channels list
-                self.populate_channels()
-            except Exception as e:
-                self.update_status(f"Error loading file: {e}")
-
-    def on_save_csv(self) -> None:
-        """Save cleaned CSV via dialog."""
-        if self.data_ctrl.df is None:
-            self.update_status("No data to save")
+    def _build_plugin_menu(self) -> None:
+        # remove old plugin submenu if exists
+        for act in getattr(self, "plugin_actions", []):
+            self.tools_menu.removeAction(act)
+        self.plugin_actions: List[QtGui.QAction] = []
+        plugin_names = self.plugins.menu_entries()
+        if not plugin_names:
             return
+        self.tools_menu.addSeparator()
+        for name in plugin_names:
+            act = self.tools_menu.addAction(f"Plugin: {name}", lambda n=name: self.apply_plugin(n))
+            self.plugin_actions.append(act)
+
+    def _reload_plugins(self) -> None:
+        self.plugins.load_plugins()
+        self._build_plugin_menu()
+        self.statusBar().showMessage("Plugins reloaded")
+
+    def _connect_signals(self) -> None:
+        self.channel_manager.channelToggled.connect(self.update_channels)
+        self.data_model.dataChanged.connect(self._on_data_changed)
+        self.data_model.annotationsChanged.connect(self._on_annotations_changed)
+        self.data_model.historyChanged.connect(self._on_history_changed)
+        self.data_model.statusMessage.connect(self.statusBar().showMessage)
+        self.plot2d.widget.scene().sigMouseClicked.connect(self.on_plot_clicked)
+        self.plot2d.set_selection_callback(self.on_region_dragged)
+        self.ann_table.itemSelectionChanged.connect(self.on_annotation_selected)
+        self.ann_table.itemDoubleClicked.connect(self.on_annotation_edit)
+        self.play_action.triggered.connect(self.toggle_playback)
+        self.show_3d_action.toggled.connect(self.toggle_3d_visibility)
+        self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
+        self.cursor_slider.valueChanged.connect(self._on_slider_changed)
+        self.snap_index_chk.stateChanged.connect(self._on_snap_changed)
+        self.snap_peak_chk.stateChanged.connect(self._on_snap_changed)
+        self.play_timer.timeout.connect(self._advance_time)
+        self.project_panel.trialSelected.connect(self._load_trial_from_project)
+        self._build_plugin_menu()
+        self.autosave_timer.timeout.connect(self.autosave)
+        self.autosave_timer.start()
+
+    def on_open_csv(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        self.load_file(path)
+        for t in self.project.trials:
+            if t.path == path:
+                t.status = "loaded"
+        self.project_panel.refresh()
+
+    def load_file(self, path: str) -> None:
+        self.data_model.load_csv(path)
+        self.filter_engine.set_sample_rate(self.data_model.sample_rate)
+        groups = self.data_model.channel_groups()
+        self.channel_manager.populate(self.data_model.time_columns, self.data_model.metadata_columns, groups)
+        self.update_channels()
+        self._update_episode_overlay()
+        self.statusBar().showMessage(f"Loaded {os.path.basename(path)} | fs={self.data_model.sample_rate} Hz")
+
+    def on_save_clean(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save cleaned CSV", "", "CSV files (*.csv)")
-        if path:
-            # Ensure .csv extension
-            if not path.lower().endswith(".csv"):
-                path += ".csv"
-            self.data_ctrl.save_cleaned_csv(path)
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self.data_model.save_clean(path)
 
     def on_save_annotations(self) -> None:
-        """Save annotations and deletions via dialog."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save annotations", "", "JSON files (*.json)")
-        if path:
-            if not path.lower().endswith(".json"):
-                path += ".json"
-            self.data_ctrl.save_annotations(path)
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        self.data_model.save_annotations(path)
 
     def on_load_annotations(self) -> None:
-        """Load annotations from file and apply."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load annotations", "", "JSON files (*.json)")
-        if path:
-            self.data_ctrl.load_annotations(path)
-
-    def populate_channels(self) -> None:
-        """Populate channel checkboxes based on loaded data."""
-        # Clear existing checkboxes
-        for i in reversed(range(self.channel_layout.count())):
-            item = self.channel_layout.itemAt(i)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-        # Create a checkbox for each signal column
-        for col in self.data_ctrl.signal_columns:
-            cb = QtWidgets.QCheckBox(col)
-            cb.stateChanged.connect(self.on_channel_toggled)
-            self.channel_layout.addWidget(cb)
-        # Check first few by default
-        for idx in range(min(5, self.channel_layout.count())):
-            item = self.channel_layout.itemAt(idx)
-            cb = item.widget()
-            if isinstance(cb, QtWidgets.QCheckBox):
-                cb.setChecked(True)
-
-    def on_channel_toggled(self) -> None:
-        """Update plots when a channel checkbox state changes."""
-        channels = []
-        for i in range(self.channel_layout.count()):
-            item = self.channel_layout.itemAt(i)
-            cb = item.widget()
-            if isinstance(cb, QtWidgets.QCheckBox) and cb.isChecked():
-                channels.append(cb.text())
-        self.plot_manager.set_channels(channels)
-        # Immediately update regions and markers when channels change
-        self.plot_manager.update_regions(self.data_ctrl.annotations, self.data_ctrl.deletions)
-        # Clear any selection
-        self.segment_mgr.clear()
-
-    def on_data_changed(self) -> None:
-        """Refresh plot and channel list when data changes."""
-        df = self.data_ctrl.get_current_df()
-        self.plot_manager.set_data(df)
-        # Keep current channel selection if possible
-        current_channels = self.plot_manager.channels
-        # Remove channels that are no longer valid
-        valid = [ch for ch in current_channels if ch in df.columns]
-        self.plot_manager.set_channels(valid)
-        # Reset selection markers
-        self.segment_mgr.clear()
-
-    def on_annotations_changed(self) -> None:
-        """Update shaded regions when annotations or deletions change."""
-        self.plot_manager.update_regions(self.data_ctrl.annotations, self.data_ctrl.deletions)
-
-    def update_status(self, msg: str) -> None:
-        """Display status messages to the user."""
-        self.status_box.setText(msg)
-
-    def on_plot_clicked(self, event: Any) -> None:
-        """Handle click events in the plot scene to set markers."""
-        if not event.scenePos():
+        if not path:
             return
-        # Map scene position to the data's x-coordinate
-        pos = event.scenePos()
-        # Only consider clicks inside the first plot; ignore label clicks
-        if not self.plot_manager.plots:
-            return
-        view_box = self.plot_manager.plots[0].getViewBox()
-        if view_box.mapRectFromScene(pos.toPoint()).contains(pos):
-            x_val = view_box.mapSceneToView(pos).x()
-            # Snap to nearest sample time for accuracy
-            x_val = float(x_val)
-            # Update markers through SegmentManager
-            self.segment_mgr.set_marker(x_val)
+        self.data_model.load_annotations(path)
+        self._on_annotations_changed()
 
-    def on_selection_changed(self, start: float, end: float) -> None:
-        """When both markers are set, draw lines and optionally update UI."""
-        if np.isnan(start) or np.isnan(end):
-            # Selection cleared
-            self.plot_manager.clear_markers()
+    def on_new_project(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "New project", "", "Project files (*.json)")
+        if not path:
+            return
+        self.project.new_project(path)
+        self.project_panel.refresh()
+
+    def on_open_project(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open project", "", "Project files (*.json)")
+        if not path:
+            return
+        self.project.load(path)
+        self.project_panel.refresh()
+        if self.project.trials:
+            self.statusBar().showMessage("Project loaded. Double-click a trial to open.")
+
+    def on_save_project(self) -> None:
+        self.project.save()
+        self.statusBar().showMessage("Project saved")
+
+    def _load_trial_from_project(self, path: str) -> None:
+        self.load_file(path)
+
+    def on_preferences(self) -> None:
+        dlg = PreferencesDialog(self.data_model.sample_rate, self)
+        dlg.output_dir.setText(self.project.preferences.get("default_output_dir", ""))
+        if dlg.exec():
+            vals = dlg.values()
+            self.data_model.set_sample_rate(vals["fs"])
+            self.filter_engine.set_sample_rate(vals["fs"])
+            self.project.preferences["default_output_dir"] = vals["output_dir"]
+            self.project.save()
+
+    def on_shortcuts(self) -> None:
+        ShortcutDialog(self).exec()
+
+    def on_wizard(self) -> None:
+        GuidedWizard(self).exec()
+
+    def on_frames(self) -> None:
+        dlg = FrameManagerDialog(self.frames, self)
+        if dlg.exec():
+            self.frames = dlg.frames_data()
+
+    def on_frame_transform(self) -> None:
+        if self.data_model.df is None or not self.data_model.signal_columns:
+            return
+        cols = self.data_model.signal_columns
+        src, ok = QtWidgets.QInputDialog.getItem(self, "Source heading", "Choose source", cols, editable=False)
+        if not ok:
+            return
+        dst, ok = QtWidgets.QInputDialog.getItem(self, "Target heading", "Choose target", cols, editable=False)
+        if not ok:
+            return
+        offset, _ = QtWidgets.QInputDialog.getDouble(self, "Offset", "Offset degrees", value=0.0, decimals=2)
+        new_name, ok = QtWidgets.QInputDialog.getText(self, "New channel", "Name", text=f"{src}_vs_{dst}")
+        if not ok or not new_name:
+            return
+        df = self.data_model.get_dataframe()
+        if src not in df or dst not in df:
+            return
+        df[new_name] = ((df[src] - df[dst] - offset + 180) % 360) - 180
+        if new_name not in self.data_model.signal_columns:
+            self.data_model.signal_columns.append(new_name)
+        self.data_model.apply_dataframe(df, "frame_transform", 0.0, df["normalized_time"].max(), {"source": src, "target": dst, "offset": offset})
+
+    def on_mapping(self) -> None:
+        if self.data_model.df is None:
+            return
+        dlg = MappingDialog(list(self.data_model.df.columns), self)
+        if dlg.exec():
+            self.mapping = dlg.mapping()
+            if self.mapping:
+                self.show_3d_action.setChecked(True)
+            self.statusBar().showMessage("3D mapping updated")
+
+    def on_filters(self) -> None:
+        if self.data_model.df is None:
+            return
+        dlg = FilterDialog(self.data_model.signal_columns, self)
+        if not dlg.exec():
+            return
+        chans = dlg.selected_channels()
+        params = dlg.parameters()
+        selection = None
+        if params.pop("apply_selection") and all(self.selection):
+            selection = tuple(sorted(self.selection))  # type: ignore
+        filter_type = params.pop("filter")
+        df_new = self.filter_engine.apply(
+            self.data_model.get_dataframe(), chans, filter_type, params, selection=selection
+        )
+        start = selection[0] if selection else 0.0
+        end = selection[1] if selection else df_new["normalized_time"].max()
+        self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
+
+    def save_recipe(self) -> None:
+        if not self.data_model.history:
+            QtWidgets.QMessageBox.information(self, "No history", "Perform some operations before saving a recipe.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save recipe", "", "JSON files (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        data = {"operations": [rec.__dict__ for rec in self.data_model.history]}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        self.statusBar().showMessage(f"Recipe saved to {path}")
+
+    def apply_recipe_to_trials(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open recipe", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                recipe = json.load(f)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Recipe error", str(exc))
+            return
+        targets = self.project_panel.selected_trials()
+        if not targets and self.data_model.df is not None:
+            # apply to current only
+            targets = ["__current__"]
+        for trial_path in targets:
+            model = self.data_model if trial_path == "__current__" else DataModel()
+            if trial_path != "__current__":
+                try:
+                    model.load_csv(trial_path)
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(self, "Load error", f"{trial_path}: {exc}")
+                    continue
+            self.filter_engine.set_sample_rate(model.sample_rate)
+            df = model.get_dataframe()
+            for op in recipe.get("operations", []):
+                desc = op.get("description")
+                params = op.get("params", {})
+                if desc == "filter":
+                    chans = params.get("channels", model.signal_columns)
+                    f_params = {k: v for k, v in params.items() if k != "channels"}
+                    df = self.filter_engine.apply(df, chans, f_params.get("filter_type", params.get("filter", "moving_average")), f_params)
+                elif desc and desc.startswith("plugin:"):
+                    plugin_name = desc.split(":", 1)[1]
+                    self.apply_plugin(plugin_name)
+            if trial_path == "__current__":
+                model.apply_dataframe(df, "recipe", 0.0, df["normalized_time"].max(), {"recipe": os.path.basename(path)})
+            else:
+                model.set_dataframe(df)
+                out_path = os.path.splitext(trial_path)[0] + "_recipe.csv"
+                model.save_clean(out_path)
+        self.statusBar().showMessage("Recipe applied")
+
+    def apply_plugin(self, name: str) -> None:
+        plugin = self.plugins.get_plugin(name)
+        if not plugin or self.data_model.df is None:
+            return
+        self.filter_engine.set_sample_rate(self.data_model.sample_rate)
+        df = self.data_model.get_dataframe()
+        ops = plugin.get("operations", [plugin])
+        for op in ops:
+            op_type = op.get("type", "")
+            if op_type == "filter":
+                channels = op.get("channels", self.data_model.signal_columns)
+                ftype = op.get("filter", "moving_average")
+                params = op.get("params", {})
+                df = self.filter_engine.apply(df, channels, ftype, params)
+            elif op_type == "derived":
+                expr = op.get("expr")
+                out = op.get("name", "derived")
+                if expr:
+                    try:
+                        df[out] = pd.eval(expr, local_dict=df.to_dict("series"))
+                        if out not in self.data_model.signal_columns:
+                            self.data_model.signal_columns.append(out)
+                    except Exception as exc:
+                        QtWidgets.QMessageBox.warning(self, "Plugin error", str(exc))
+        self.data_model.apply_dataframe(df, f"plugin:{name}", 0.0, df["normalized_time"].max(), {"plugin": name})
+
+    def on_export_figure(self) -> None:
+        if self.data_model.df is None:
+            return
+        dlg = ExportFigureDialog(self)
+        if not dlg.exec():
+            return
+        params = dlg.export_params()
+        fmt = params["format"].lower()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export figure", f"figure.{fmt}", f"*.{fmt}")
+        if not path:
+            return
+        if not path.lower().endswith(f".{fmt}"):
+            path += f".{fmt}"
+        self._export_view(path, fmt, params)
+
+    def _export_view(self, path: str, fmt: str, params: Dict) -> None:
+        try:
+            if fmt == "png":
+                exporter = pg.exporters.ImageExporter(self.plot2d.widget.scene())
+                exporter.parameters()["width"] = int(params.get("width_cm", 10) / 2.54 * params.get("dpi", 200))
+                exporter.export(path)
+            elif fmt == "svg":
+                exporter = pg.exporters.SVGExporter(self.plot2d.widget.scene())
+                exporter.export(path)
+            elif fmt == "pdf":
+                printer = QtGui.QPdfWriter(path)
+                printer.setResolution(int(params.get("dpi", 200)))
+                painter = QtGui.QPainter(printer)
+                self.plot2d.widget.render(painter)
+                painter.end()
+            self.statusBar().showMessage(f"Exported figure to {path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+
+    def toggle_playback(self) -> None:
+        self.playing = not self.playing
+        if self.playing:
+            self.play_timer.start()
         else:
-            # Draw markers
-            self.plot_manager.draw_marker(0, start)
-            self.plot_manager.draw_marker(1, end)
-            # Optionally show in status
-            self.update_status(f"Selected segment: {start:.3f}–{end:.3f}s")
+            self.play_timer.stop()
 
-    def on_delete_segment(self) -> None:
-        """Trigger deletion of currently selected segment."""
-        if self.segment_mgr.start is None or self.segment_mgr.end is None:
-            self.update_status("Select start and end points first")
-            return
-        s, e = sorted([self.segment_mgr.start, self.segment_mgr.end])
-        self.data_ctrl.delete_segment(s, e)
-        # After deletion, clear selection markers
-        self.segment_mgr.clear()
+    def toggle_3d_visibility(self, visible: bool) -> None:
+        self.gl_container.setVisible(visible)
+        if not visible:
+            # widen 2D plot when hiding 3D
+            self.splitter.setSizes([1, 0])
+        else:
+            # restore reasonable split
+            self.splitter.setSizes([1200, 400])
 
-    def on_annotate_segment(self) -> None:
-        """Trigger annotation of currently selected segment with chosen label."""
-        if self.segment_mgr.start is None or self.segment_mgr.end is None:
-            self.update_status("Select start and end points first")
+    def _on_speed_changed(self, text: str) -> None:
+        try:
+            self.play_speed = float(text.rstrip("x"))
+        except Exception:
+            self.play_speed = 1.0
+
+    def _advance_time(self) -> None:
+        if self.data_model.df is None:
             return
-        s, e = sorted([self.segment_mgr.start, self.segment_mgr.end])
-        # Determine label: if custom field non-empty use that; else dropdown
-        custom = self.custom_label_edit.text().strip()
-        label = custom if custom else self.label_combo.currentText()
-        self.data_ctrl.annotate_segment(s, e, label)
-        # Clear selection markers but keep drawn regions
-        self.segment_mgr.clear()
+        t_max = float(self.data_model.df["normalized_time"].max())
+        cur = self.cursor_slider.value() / 1000.0 * t_max
+        delta = self.play_speed / self.data_model.sample_rate
+        new_t = cur + delta
+        if new_t >= t_max:
+            new_t = 0.0
+        self.set_time_cursor(new_t)
+
+    def _on_slider_changed(self, value: int) -> None:
+        if self.data_model.df is None:
+            return
+        t_max = float(self.data_model.df["normalized_time"].max())
+        t = value / 1000.0 * t_max
+        self.set_time_cursor(t)
+
+    def set_time_cursor(self, t: float) -> None:
+        self.plot2d.set_time_cursor(t)
+        if self.gl_container.isVisible():
+            self.plot3d.update_time(t)
+        if self.data_model.df is not None:
+            self.cursor_slider.blockSignals(True)
+            t_max = float(self.data_model.df["normalized_time"].max())
+            val = int(1000 * t / t_max) if t_max > 0 else 0
+            self.cursor_slider.setValue(val)
+            self.cursor_slider.blockSignals(False)
+
+    def on_plot_clicked(self, event: pg.GraphicsScene.mouseEvents) -> None:
+        if not self.plot2d.plots:
+            return
+        pos = event.scenePos()
+        vb = self.plot2d.plots[0].getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            return
+        mouse_point = vb.mapSceneToView(pos)
+        t = float(mouse_point.x())
+        t = self._snap_time(t)
+        if self.selection[0] is None:
+            self.selection = (t, None)
+        elif self.selection[1] is None:
+            self.selection = (self.selection[0], t)
+            self._apply_selection_to_view()
+        else:
+            self.selection = (t, None)
+        self._draw_markers()
+
+    def _snap_time(self, t: float) -> float:
+        if self.data_model.df is None:
+            return t
+        time_col = self.data_model.df["normalized_time"].values
+        if self.snap_to_index:
+            idx = np.abs(time_col - t).argmin()
+            t = float(time_col[idx])
+        if self.snap_peak_chk.isChecked() and self.plot2d.channels:
+            ch = self.plot2d.channels[0]
+            vals = self.data_model.df[ch].values
+            idx = np.abs(time_col - t).argmin()
+            window = slice(max(0, idx - 3), min(len(vals), idx + 4))
+            local = vals[window]
+            if len(local) > 0:
+                if abs(local.max() - vals[idx]) < abs(local.min() - vals[idx]):
+                    idx_local = window.start + local.argmin()
+                else:
+                    idx_local = window.start + local.argmax()
+                t = float(time_col[idx_local])
+        return t
+
+    def _apply_selection_to_view(self) -> None:
+        if None not in self.selection:
+            start, end = sorted(self.selection)  # type: ignore
+            self.plot2d.set_selection(start, end)
+            self.statusBar().showMessage(f"Selected {start:.3f}-{end:.3f} s")
+
+    def _draw_markers(self) -> None:
+        if self.selection[0] is None:
+            self.plot2d.clear_selection()
+        elif self.selection[1] is None:
+            self.plot2d.set_selection(self.selection[0], self.selection[0] + 0.05)
+        else:
+            self._apply_selection_to_view()
+
+    def on_region_dragged(self, start: float, end: float) -> None:
+        self.selection = (start, end)
+        self.statusBar().showMessage(f"Selected {start:.3f}-{end:.3f} s")
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
+        key = event.key()
+        if key == QtCore.Qt.Key.Key_D:
+            self.delete_selection()
+        elif key == QtCore.Qt.Key.Key_M:
+            self.mark_bad_selection()
+        elif key == QtCore.Qt.Key.Key_A:
+            self.annotate_selection()
+        elif key == QtCore.Qt.Key.Key_U:
+            self.data_model.undo()
+        elif key == QtCore.Qt.Key.Key_R:
+            self.data_model.redo()
+        elif key == QtCore.Qt.Key.Key_Left:
+            self._nudge_time(-1)
+        elif key == QtCore.Qt.Key.Key_Right:
+            self._nudge_time(1)
+        else:
+            super().keyPressEvent(event)
+
+    def _nudge_time(self, steps: int) -> None:
+        if self.data_model.df is None:
+            return
+        dt = 1.0 / max(self.data_model.sample_rate, 1.0)
+        if self.selection[0] is not None and self.selection[1] is not None:
+            shift = steps * dt
+            self.selection = (self.selection[0] + shift, self.selection[1] + shift)
+            self._apply_selection_to_view()
+        else:
+            current = self.cursor_slider.value() / 1000.0 * float(self.data_model.df["normalized_time"].max())
+            self.set_time_cursor(current + steps * dt)
+
+    def _selection_values(self) -> Optional[Tuple[float, float]]:
+        if None in self.selection:
+            return None
+        return tuple(sorted(self.selection))  # type: ignore
+
+    def delete_selection(self) -> None:
+        sel = self._selection_values()
+        if not sel:
+            return
+        self.data_model.delete_segment(*sel)
+        self.selection = (None, None)
+        self.plot2d.clear_selection()
+
+    def mark_bad_selection(self) -> None:
+        sel = self._selection_values()
+        if not sel:
+            return
+        self.data_model.mark_bad(*sel)
+
+    def annotate_selection(self) -> None:
+        sel = self._selection_values()
+        if not sel:
+            return
+        label, ok = QtWidgets.QInputDialog.getText(self, "Annotation label", "Label", text="blink")
+        if not ok or not label:
+            return
+        track, _ = QtWidgets.QInputDialog.getText(self, "Track", "Track (e.g., eye, body)", text="default")
+        color = "#4e79a7"
+        self.data_model.annotate(*sel, label=label, track=track or "default", color=color)
+
+    def _on_data_changed(self) -> None:
+        df = self.data_model.get_dataframe()
+        self.plot2d.set_data(df)
+        self.plot3d.set_data(df)
+        if not df.empty:
+            self.cursor_slider.setEnabled(True)
+        self.autosave()
+
+    def _on_annotations_changed(self) -> None:
+        self.ann_table.populate(self.data_model.annotations)
+        self.plot2d.update_annotations(self.data_model.annotations, self.data_model.deletions)
+        self.autosave()
+
+    def _on_history_changed(self) -> None:
+        self.history_widget.clear()
+        for record in self.data_model.history:
+            self.history_widget.push(f"{record.description} [{record.start:.2f}-{record.end:.2f}] {record.params}")
+        self.autosave()
+
+    def update_channels(self) -> None:
+        chans = self.channel_manager.get_checked_channels()
+        self.plot2d.set_channels(chans)
+
+    def on_annotation_selected(self) -> None:
+        ann_id = self.ann_table.selected_annotation_id()
+        if ann_id == -1:
+            return
+        for ann in self.data_model.annotations:
+            if ann.id == ann_id:
+                self.selection = (ann.start, ann.end)
+                self._apply_selection_to_view()
+                self.set_time_cursor(ann.start)
+                break
+
+    def on_annotation_edit(self) -> None:
+        ann_id = self.ann_table.selected_annotation_id()
+        if ann_id == -1:
+            return
+        for ann in self.data_model.annotations:
+            if ann.id == ann_id:
+                new_label, ok = QtWidgets.QInputDialog.getText(self, "Edit annotation", "Label", text=ann.label)
+                if ok and new_label:
+                    ann.label = new_label
+                new_track, ok = QtWidgets.QInputDialog.getText(self, "Track", "Track", text=ann.track)
+                if ok and new_track:
+                    ann.track = new_track
+                self._on_annotations_changed()
+                break
+
+    def _show_annotation_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        edit_act = menu.addAction("Edit", self.on_annotation_edit)
+        delete_act = menu.addAction("Delete", self.delete_annotation)
+        jump_act = menu.addAction("Jump to segment", self.on_annotation_selected)
+        menu.exec(self.ann_table.mapToGlobal(pos))
+
+    def delete_annotation(self) -> None:
+        ann_id = self.ann_table.selected_annotation_id()
+        if ann_id == -1:
+            return
+        self.data_model.annotations = [a for a in self.data_model.annotations if a.id != ann_id]
+        self._on_annotations_changed()
+
+    def _on_snap_changed(self) -> None:
+        self.snap_to_index = self.snap_index_chk.isChecked()
+
+    def _update_episode_overlay(self) -> None:
+        if self.data_model.df is None:
+            return
+        df = self.data_model.df
+        if "episode_index" not in df.columns or "episode_type" not in df.columns:
+            return
+        types = df["episode_type"].fillna("episode").astype(str)
+        idxs = df["episode_index"].fillna(method="ffill").astype(int)
+        for ep in idxs.unique():
+            ep_mask = idxs == ep
+            start = df.loc[ep_mask, "normalized_time"].min()
+            end = df.loc[ep_mask, "normalized_time"].max()
+            label = types.loc[ep_mask].mode().iloc[0]
+            self.data_model.annotations.append(AnnotationSegment(start=start, end=end, label=f"episode:{label}"))
+        self._on_annotations_changed()
+
+    def autosave(self) -> None:
+        try:
+            state = {
+                "data": self.data_model.get_dataframe().to_dict(orient="list") if self.data_model.df is not None else None,
+                "annotations": [ann.__dict__ for ann in self.data_model.annotations],
+                "deletions": self.data_model.deletions,
+            }
+            with open(self.autosave_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    def restore_autosave(self) -> None:
+        if not os.path.isfile(self.autosave_path):
+            return
+        try:
+            with open(self.autosave_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            data_dict = state.get("data")
+            if data_dict:
+                df = pd.DataFrame(data_dict)
+                self.data_model.set_dataframe(df)
+                self.data_model.annotations = [AnnotationSegment(**a) for a in state.get("annotations", [])]
+                self.data_model.deletions = [tuple(d) for d in state.get("deletions", [])]
+                groups = self.data_model.channel_groups()
+                self.channel_manager.populate(self.data_model.time_columns, self.data_model.metadata_columns, groups)
+                self.update_channels()
+                self._on_annotations_changed()
+                self.statusBar().showMessage("Restored autosave session")
+        except Exception:
+            pass
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        self.autosave()
+        super().closeEvent(event)
 
 
 def main() -> None:
-    import sys
     app = QtWidgets.QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
