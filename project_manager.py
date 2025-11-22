@@ -13,6 +13,7 @@ class TrialEntry:
     participant: str = ""
     condition: str = ""
     status: str = "unloaded"  # unloaded / loaded / cleaned / exported
+    summary: str = ""
     notes: str = ""
 
 
@@ -40,6 +41,14 @@ class ProjectManager:
 
     def add_trial(self, path: str, participant: str = "", condition: str = "") -> None:
         self.trials.append(TrialEntry(path=path, participant=participant, condition=condition))
+
+    def update_status(self, path: str, status: str, summary: str = "") -> None:
+        for t in self.trials:
+            if t.path == path:
+                t.status = status
+                if summary:
+                    t.summary = summary
+                break
 
     def save(self) -> None:
         if not self.project_path:

@@ -209,6 +209,25 @@ class DataModel(QtCore.QObject):
         self.historyChanged.emit()
         self.statusMessage.emit(f"Annotated {start:.3f}-{end:.3f} s as {label}")
 
+    def update_annotation(self, ann_id: int, start: float, end: float, label: Optional[str], track: Optional[str], color: Optional[str]) -> None:
+        for ann in self.annotations:
+            if ann.id == ann_id:
+                ann.start = start
+                ann.end = end
+                if label is not None:
+                    ann.label = label
+                if track is not None:
+                    ann.track = track
+                if color is not None:
+                    ann.color = color
+                self.annotationsChanged.emit()
+                self.statusMessage.emit(f"Updated annotation {ann_id}")
+                break
+
+    def delete_annotation(self, ann_id: int) -> None:
+        self.annotations = [a for a in self.annotations if a.id != ann_id]
+        self.annotationsChanged.emit()
+
     def get_dataframe(self) -> pd.DataFrame:
         return self.df.copy() if self.df is not None else pd.DataFrame()
 
@@ -251,8 +270,25 @@ class DataModel(QtCore.QObject):
         anns = data.get("annotations", [])
         dels = data.get("deletions", [])
         self.annotations = [AnnotationSegment(**a) for a in anns]
-        self.deletions = [(d["start"], d["end"]) for d in dels]
+        parsed_deletions: List[Tuple[float, float]] = []
+        for d in dels:
+            if isinstance(d, dict) and "start" in d and "end" in d:
+                try:
+                    parsed_deletions.append((float(d["start"]), float(d["end"])))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(d, (list, tuple)) and len(d) == 2:
+                try:
+                    parsed_deletions.append((float(d[0]), float(d[1])))
+                except (TypeError, ValueError):
+                    continue
+        self.deletions = parsed_deletions
         self.history = [OperationRecord(**h) for h in data.get("history", [])]
+        if "sample_rate" in data:
+            try:
+                self.sample_rate = float(data["sample_rate"])
+            except (TypeError, ValueError):
+                pass
         if self.annotations:
             self._id_counter = max(a.id for a in self.annotations) + 1
         self.annotationsChanged.emit()
@@ -278,10 +314,12 @@ class DataModel(QtCore.QObject):
                 groups["Gaze"].append(col)
             elif "head" in name:
                 groups["Head"].append(col)
-            elif "torso" in name:
-                groups["Torso"].append(col)
-            elif "foot" in name:
-                groups["Feet"].append(col)
+            elif "chest" in name:
+                groups["Chest"].append(col)
+            elif "left_foot" in name:
+                groups["Left Foot"].append(col)
+            elif "right_foot" in name:
+                groups["Right Foot"].append(col)
             elif "chair" in name:
                 groups["Chair"].append(col)
             elif "gmm" in name:
