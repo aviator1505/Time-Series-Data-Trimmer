@@ -239,7 +239,7 @@ The application is built on four core components:
 1. **Visual and Intuitive**: Direct manipulation of time-series data through graphical interface
 2. **Non-destructive Annotations**: Label regions of interest without altering the data
 3. **Reproducible**: Save and reload annotations for consistent data cleaning workflows
-4. **Flexible**: Works with any numeric time-series data sampled at 120 Hz
+4. **Specialized**: Optimized for numeric time-series data sampled at 120 Hz
 5. **Multiple Channels**: View and analyze multiple signals simultaneously
 6. **Undo Support**: Experiment freely with full undo/redo capabilities
 7. **Metadata Preservation**: Non-numeric columns are maintained through all operations
@@ -333,5 +333,5 @@ For questions, issues, or suggestions, please open an issue on GitHub or contact
 ---
 
 **Version**: 1.0  
-**Last Updated**: November 2025  
+**Last Updated**: November 2024  
 **Status**: Active Development
