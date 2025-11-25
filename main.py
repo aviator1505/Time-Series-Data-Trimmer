@@ -138,6 +138,52 @@ class ChannelManagerWidget(QtWidgets.QWidget):
                 w.setChecked(w.text() in chans)
 
 
+class ChannelStylePanel(QtWidgets.QWidget):
+    """Assign per-channel plot styles overriding the global plot style."""
+
+    styleChanged = QtCore.pyqtSignal(str, str)
+
+    def __init__(self, style_map: Dict[str, str], parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.style_map = {k: v for k, v in style_map.items() if v in ("line", "scatter", "area")}
+        self.styles: Dict[str, str] = {}
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel("Channel plot styles (default inherits toolbar)"))
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QtWidgets.QWidget()
+        self.container_layout = QtWidgets.QFormLayout(self.container)
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll, 1)
+        layout.addStretch(1)
+
+    def set_channels(self, channels: List[str]) -> None:
+        # preserve existing style choices when possible
+        existing = dict(self.styles)
+        # clear rows
+        while self.container_layout.count():
+            item = self.container_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        for ch in channels:
+            combo = QtWidgets.QComboBox()
+            combo.addItem("Default", userData="")
+            for label, key in self.style_map.items():
+                combo.addItem(label, userData=key)
+            prev = existing.get(ch, "")
+            idx = combo.findData(prev)
+            if idx != -1:
+                combo.setCurrentIndex(idx)
+            combo.currentIndexChanged.connect(lambda _=0, c=ch, cb=combo: self._on_changed(c, cb))
+            self.container_layout.addRow(ch, combo)
+        self.styles = {k: v for k, v in existing.items() if k in channels}
+
+    def _on_changed(self, channel: str, combo: QtWidgets.QComboBox) -> None:
+        style_key = combo.currentData()
+        self.styles[channel] = style_key
+        self.styleChanged.emit(channel, style_key)
+
+
 class OperationHistoryWidget(QtWidgets.QListWidget):
     def push(self, text: str) -> None:
         self.addItem(text)
@@ -231,11 +277,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
         self.plot2d = PlotController2D()
         self.plot3d = PlotController3D()
+        self.style_panel = ChannelStylePanel(
+            {
+                "Line": "line",
+                "Scatter": "scatter",
+                "Area": "area",
+            }
+        )
+        self.plot_style_map = {
+            "Line": "line",
+            "Scatter": "scatter",
+            "Area": "area",
+            "Seasonal subseries": "seasonal",
+            "Heatmap": "heatmap",
+        }
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.setInterval(40)
         self.autosave_timer = QtCore.QTimer(self)
         self.autosave_timer.setInterval(120000)
         self.play_speed = 1.0
+        self.current_time = 0.0
         self.snap_to_index = True
         self.playing = False
         self.selection: Tuple[Optional[float], Optional[float]] = (None, None)
@@ -254,9 +315,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(central)
         self.toolbar = QtWidgets.QToolBar("Playback", self)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
-        self.play_action = QtGui.QAction("Play/Pause", self)
-        self.play_action.setShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space))
+        self.prev_action = QtGui.QAction("⏮", self)
+        self.prev_action.setToolTip("Step backward")
+        self.next_action = QtGui.QAction("⏭", self)
+        self.next_action.setToolTip("Step forward")
+        self.stop_action = QtGui.QAction("⏹", self)
+        self.stop_action.setToolTip("Stop and reset (S)")
+        self.stop_action.setShortcut(QtGui.QKeySequence("S"))
+        self.play_action = QtGui.QAction("▶/⏸", self)
+        # Shortcut handled via explicit QShortcut below to avoid widget-level conflicts
+        self.play_action.setToolTip("Play/Pause (Space)")
+        self.toolbar.addAction(self.prev_action)
         self.toolbar.addAction(self.play_action)
+        self.toolbar.addAction(self.stop_action)
+        self.toolbar.addAction(self.next_action)
         self.speed_combo = QtWidgets.QComboBox()
         self.speed_combo.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
         self.speed_combo.setCurrentText("1x")
@@ -266,6 +338,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overlay_action.setCheckable(True)
         self.overlay_action.setChecked(False)
         self.toolbar.addAction(self.overlay_action)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(QtWidgets.QLabel("Plot style"))
+        self.plot_style_combo = QtWidgets.QComboBox()
+        self.plot_style_combo.addItems(list(self.plot_style_map.keys()))
+        self.plot_style_combo.setCurrentText("Line")
+        self.toolbar.addWidget(self.plot_style_combo)
+        self.season_label = QtWidgets.QLabel("Period")
+        self.season_label.setVisible(False)
+        self.season_period_spin = QtWidgets.QDoubleSpinBox()
+        self.season_period_spin.setRange(0.01, 1e6)
+        self.season_period_spin.setDecimals(2)
+        self.season_period_spin.setValue(1.0)
+        self.season_period_spin.setSuffix(" s")
+        self.season_period_spin.setSingleStep(0.1)
+        self.season_period_spin.setVisible(False)
+        self.toolbar.addWidget(self.season_label)
+        self.toolbar.addWidget(self.season_period_spin)
         self.annotation_mode_action = QtGui.QAction("Annotation mode", self)
         self.annotation_mode_action.setCheckable(True)
         self.annotation_mode_action.setToolTip("When enabled: click start/end points to create annotations quickly.")
@@ -302,6 +391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ann_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ann_table.customContextMenuRequested.connect(self._show_annotation_menu)
         self.filter_dock = self._add_dock("Filters", self.filter_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.style_dock = self._add_dock("Plot styles", self.style_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
         self._add_dock("Channel Manager", self.channel_manager, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
         self._add_dock("Annotations", self.ann_table, QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
         self._add_dock("Operation History", self.history_widget, QtCore.Qt.DockWidgetArea.BottomDockWidgetArea)
@@ -390,11 +480,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot2d.set_annotation_drag_callback(self.on_annotation_dragged)
         self.filter_panel.applyRequested.connect(lambda: self.apply_filters_from_panel(preview=False))
         self.filter_panel.previewRequested.connect(lambda: self.apply_filters_from_panel(preview=True))
+        self.style_panel.styleChanged.connect(self.on_channel_style_changed)
         self.ann_table.itemSelectionChanged.connect(self.on_annotation_selected)
         self.ann_table.itemDoubleClicked.connect(self.on_annotation_edit)
         self.suggestions.itemDoubleClicked.connect(self.on_accept_suggestion)
         self.play_action.triggered.connect(self.toggle_playback)
+        self.stop_action.triggered.connect(self.stop_playback)
+        self.prev_action.triggered.connect(lambda: self._nudge_time(-1))
+        self.next_action.triggered.connect(lambda: self._nudge_time(1))
         self.overlay_action.toggled.connect(self.on_overlay_toggled)
+        self.plot_style_combo.currentTextChanged.connect(self.on_plot_style_changed)
+        self.season_period_spin.valueChanged.connect(self.on_season_period_changed)
         self.annotation_mode_action.toggled.connect(self.on_annotation_mode_toggled)
         self.show_3d_action.toggled.connect(self.toggle_3d_visibility)
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
@@ -406,6 +502,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_plugin_menu()
         self.autosave_timer.timeout.connect(self.autosave)
         self.autosave_timer.start()
+        # Global playback shortcut to avoid widget-level space handling conflicts
+        self.play_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self)
+        self.play_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        self.play_shortcut.activated.connect(self.toggle_playback)
 
     def on_open_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV files (*.csv)")
@@ -766,8 +866,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playing = not self.playing
         if self.playing:
             self.play_timer.start()
+            self.statusBar().showMessage("Playback started")
         else:
             self.play_timer.stop()
+            self.statusBar().showMessage("Playback paused")
+
+    def stop_playback(self) -> None:
+        self.playing = False
+        self.play_timer.stop()
+        self.set_time_cursor(0.0)
+        self.statusBar().showMessage("Playback stopped")
 
     def toggle_3d_visibility(self, visible: bool) -> None:
         self.gl_container.setVisible(visible)
@@ -792,7 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.data_model.df is None:
             return
         t_max = float(self.data_model.df["normalized_time"].max())
-        cur = self.cursor_slider.value() / 1000.0 * t_max
+        cur = self.current_time
         delta = self.play_speed / self.data_model.sample_rate
         new_t = cur + delta
         if new_t >= t_max:
@@ -817,6 +925,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Annotation mode OFF")
 
     def set_time_cursor(self, t: float) -> None:
+        self.current_time = float(t)
         self.plot2d.set_time_cursor(t)
         if self.gl_container.isVisible():
             self.plot3d.update_time(t)
@@ -933,8 +1042,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selection = (self.selection[0] + shift, self.selection[1] + shift)
             self._apply_selection_to_view()
         else:
-            current = self.cursor_slider.value() / 1000.0 * float(self.data_model.df["normalized_time"].max())
-            self.set_time_cursor(current + steps * dt)
+            self.set_time_cursor(self.current_time + steps * dt)
 
     def _selection_values(self) -> Optional[Tuple[float, float]]:
         if None in self.selection:
@@ -995,6 +1103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot2d.set_data(df)
         self.plot3d.set_data(df)
         self.filter_panel.set_channels(self.data_model.signal_columns)
+        self.style_panel.set_channels(self.data_model.signal_columns)
         if not df.empty:
             self.cursor_slider.setEnabled(True)
         self.autosave()
@@ -1049,6 +1158,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_overlay_toggled(self, enabled: bool) -> None:
         self.plot2d.set_overlay_mode(enabled)
         self.update_channels()
+
+    def on_plot_style_changed(self, label: str) -> None:
+        style = self.plot_style_map.get(label, "line")
+        self.plot2d.set_plot_style(style)
+        seasonal = style == "seasonal"
+        self.season_label.setVisible(seasonal)
+        self.season_period_spin.setVisible(seasonal)
+
+    def on_season_period_changed(self, period: float) -> None:
+        self.plot2d.set_season_period(period)
+
+    def on_channel_style_changed(self, channel: str, style: str) -> None:
+        self.plot2d.set_channel_style(channel, style or None)
 
     def on_annotation_edit(self) -> None:
         ann_id = self.ann_table.selected_annotation_id()

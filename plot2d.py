@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt6 import QtGui
+from PyQt6 import QtCore, QtGui
 import pyqtgraph as pg
 
 from data_model import AnnotationSegment
@@ -22,10 +22,33 @@ class PlotController2D:
         self.annotation_regions: List[pg.LinearRegionItem] = []
         self.annotation_clone_regions: List[pg.LinearRegionItem] = []
         self.deletion_regions: List[pg.LinearRegionItem] = []
+        self.plot_style: str = "line"
+        self.channel_styles: Dict[str, str] = {}
+        self.season_period: float = 1.0
         self.marker_color = (80, 80, 220)
         self.selection_callback = None
         self.overlay_mode: bool = False
         self.annotation_drag_callback = None
+        self.hover_label = pg.TextItem(
+            "",
+            anchor=(0, 1),
+            color=(30, 30, 30),
+            border=pg.mkPen((60, 60, 60)),
+            fill=pg.mkBrush(255, 255, 255, 230),
+        )
+        self.hover_label.setZValue(20)
+        self.hover_label.setVisible(False)
+        self.hover_dot = pg.ScatterPlotItem(
+            size=8, pen=pg.mkPen((40, 40, 40), width=1.2), brush=pg.mkBrush(255, 255, 255), pxMode=True
+        )
+        self.hover_dot.setZValue(19)
+        self.hover_dot.setVisible(False)
+        scene = self.widget.scene()
+        self._hover_proxy = pg.SignalProxy(scene.sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved) if scene else None
+        self._hover_plot: Optional[pg.PlotItem] = None
+        self.plot_channels: Dict[pg.PlotItem, List[str]] = {}
+        self.time_values: np.ndarray = np.array([])
+        self.hover_threshold_px = 20.0
         self.set_style()
 
     def set_style(self) -> None:
@@ -36,7 +59,13 @@ class PlotController2D:
         self.refresh_plots()
 
     def set_channels(self, channels: List[str]) -> None:
-        self.channels = channels
+        # keep only channels that exist in current data (if loaded)
+        if not self.data.empty:
+            self.channels = [ch for ch in channels if ch in self.data.columns]
+        else:
+            self.channels = channels
+        # prune styles for removed channels
+        self.channel_styles = {ch: style for ch, style in self.channel_styles.items() if ch in self.channels}
         self.refresh_plots()
 
     def refresh_plots(self) -> None:
@@ -55,39 +84,23 @@ class PlotController2D:
             except Exception:
                 cursor_pos = None
             self.time_cursor = None
+        self._reset_hover_items()
         self.annotation_regions.clear()
         self.annotation_clone_regions.clear()
         self.deletion_regions.clear()
         self.widget.clear()
         self.plots = []
+        self.plot_channels = {}
+        self.time_values = np.array([])
         if self.data.empty or not self.channels:
             return
         time = self.data["normalized_time"].values
-        if self.overlay_mode:
-            p = self.widget.addPlot(row=0, col=0)
-            p.showGrid(x=True, y=True, alpha=0.3)
-            p.setLabel("left", "Signals")
-            p.setLabel("bottom", "Time (s)")
-            legend = p.addLegend()
-            try:
-                legend.setLabelTextColor((255, 255, 255))
-            except Exception:
-                pass
-            for ch in self.channels:
-                p.plot(time, self.data[ch].values, pen=pg.mkPen(color=self._color_for_channel(ch), width=1.2), name=ch)
-            self._style_axes(p)
-            self.plots.append(p)
+        if self.plot_style == "heatmap":
+            self._draw_heatmap(time)
+        elif self.plot_style == "seasonal":
+            self._draw_seasonal(time)
         else:
-            for row, ch in enumerate(self.channels):
-                p = self.widget.addPlot(row=row, col=0)
-                p.showGrid(x=True, y=True, alpha=0.3)
-                p.setLabel("left", ch)
-                p.setLabel("bottom", "Time (s)")
-                p.plot(time, self.data[ch].values, pen=pg.mkPen(color=self._color_for_channel(ch), width=1.2))
-                if row > 0:
-                    p.setXLink(self.plots[0])
-                self._style_axes(p)
-                self.plots.append(p)
+            self._draw_standard(time)
         if self.selection_region:
             for p in self.plots:
                 p.addItem(self.selection_region)
@@ -240,6 +253,98 @@ class PlotController2D:
             start, end = self.selection_region.getRegion()
             self.selection_callback(start, end)
 
+    def _reset_hover_items(self) -> None:
+        """Remove hover helpers from any previous plot before rebuilding."""
+        if self._hover_plot:
+            try:
+                self._hover_plot.removeItem(self.hover_label)
+                self._hover_plot.removeItem(self.hover_dot)
+            except Exception:
+                pass
+        self._hover_plot = None
+        self.hover_label.setVisible(False)
+        self.hover_dot.setVisible(False)
+
+    def _hide_hover(self) -> None:
+        self.hover_label.setVisible(False)
+        self.hover_dot.setVisible(False)
+
+    def _show_hover(self, plot: pg.PlotItem, t_val: float, y_val: float, ch: str) -> None:
+        if self._hover_plot is not plot:
+            if self._hover_plot:
+                try:
+                    self._hover_plot.removeItem(self.hover_label)
+                    self._hover_plot.removeItem(self.hover_dot)
+                except Exception:
+                    pass
+            self._hover_plot = plot
+            plot.addItem(self.hover_label)
+            plot.addItem(self.hover_dot)
+        self.hover_label.setText(f"{ch}: t={t_val:.3f}s, y={y_val:.3f}")
+        self.hover_label.setPos(t_val, y_val)
+        self.hover_label.setVisible(True)
+        self.hover_dot.setData([t_val], [y_val])
+        self.hover_dot.setVisible(True)
+
+    def _nearest_point(self, plot: pg.PlotItem, scene_pos: QtCore.QPointF) -> Optional[Tuple[str, float, float]]:
+        channels = self.plot_channels.get(plot, [])
+        if not channels or self.time_values.size == 0:
+            return None
+        vb = plot.getViewBox()
+        if vb is None:
+            return None
+        view_pos = vb.mapSceneToView(scene_pos)
+        t_guess = view_pos.x()
+        idx = int(np.searchsorted(self.time_values, t_guess))
+        candidate_idxs = [idx - 1, idx, idx + 1]
+        candidate_idxs = [i for i in candidate_idxs if 0 <= i < len(self.time_values)]
+        best: Optional[Tuple[str, float, float]] = None
+        best_dist: Optional[float] = None
+        for i in candidate_idxs:
+            t_val = float(self.time_values[i])
+            for ch in channels:
+                if ch not in self.data.columns:
+                    continue
+                y_val = float(self.data[ch].iat[i])
+                if pd.isna(y_val):
+                    continue
+                pt_scene = vb.mapViewToScene(QtCore.QPointF(t_val, y_val))
+                dx = float(pt_scene.x() - scene_pos.x())
+                dy = float(pt_scene.y() - scene_pos.y())
+                dist = dx * dx + dy * dy
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best = (ch, t_val, y_val)
+        if best_dist is None or best_dist > self.hover_threshold_px ** 2:
+            return None
+        return best
+
+    def _on_mouse_moved(self, evt) -> None:
+        if not self.plots or self.data.empty:
+            self._hide_hover()
+            return
+        try:
+            scene_pos = evt[0]
+        except Exception:
+            return
+        for plot in self.plots:
+            vb = plot.getViewBox()
+            if vb is None:
+                continue
+            try:
+                if not vb.sceneBoundingRect().contains(scene_pos):
+                    continue
+            except Exception:
+                continue
+            hit = self._nearest_point(plot, scene_pos)
+            if hit is None:
+                self._hide_hover()
+                return
+            ch, t_val, y_val = hit
+            self._show_hover(plot, t_val, y_val, ch)
+            return
+        self._hide_hover()
+
     def _style_axes(self, plot: pg.PlotItem) -> None:
         """Force visible axis lines and readable tick styling."""
         pen = pg.mkPen((80, 80, 80), width=1)
@@ -302,4 +407,179 @@ class PlotController2D:
 
     def set_annotation_drag_callback(self, cb) -> None:
         self.annotation_drag_callback = cb
+
+    # ------------------------------------------------------------------
+    # Plot style helpers
+    def set_plot_style(self, style: str) -> None:
+        allowed = {"line", "scatter", "area", "seasonal", "heatmap"}
+        if style not in allowed:
+            style = "line"
+        self.plot_style = style
+        self.refresh_plots()
+
+    def set_channel_style(self, channel: str, style: Optional[str]) -> None:
+        allowed = {"line", "scatter", "area"}
+        if style is None or style == "" or style not in allowed:
+            if channel in self.channel_styles:
+                self.channel_styles.pop(channel, None)
+                self.refresh_plots()
+            return
+        self.channel_styles[channel] = style
+        self.refresh_plots()
+
+    def set_season_period(self, period: float) -> None:
+        if period <= 0:
+            return
+        self.season_period = period
+        if self.plot_style == "seasonal":
+            self.refresh_plots()
+
+    def _draw_standard(self, time: np.ndarray) -> None:
+        self.time_values = time
+        if self.overlay_mode:
+            p = self.widget.addPlot(row=0, col=0)
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setLabel("left", "Signals")
+            p.setLabel("bottom", "Time (s)")
+            legend = p.addLegend()
+            try:
+                legend.setLabelTextColor((255, 255, 255))
+            except Exception:
+                pass
+            for ch in self.channels:
+                if ch not in self.data.columns:
+                    continue
+                self._plot_series(p, time, self.data[ch].values, ch, name=ch)
+            self._style_axes(p)
+            self.plots.append(p)
+            self.plot_channels[p] = [ch for ch in self.channels if ch in self.data.columns]
+        else:
+            for row, ch in enumerate(self.channels):
+                if ch not in self.data.columns:
+                    continue
+                p = self.widget.addPlot(row=row, col=0)
+                p.showGrid(x=True, y=True, alpha=0.3)
+                p.setLabel("left", ch)
+                p.setLabel("bottom", "Time (s)")
+                self._plot_series(p, time, self.data[ch].values, ch)
+                if row > 0:
+                    p.setXLink(self.plots[0])
+                self._style_axes(p)
+                self.plots.append(p)
+                self.plot_channels[p] = [ch]
+
+    def _plot_series(self, plot: pg.PlotItem, time: np.ndarray, values: np.ndarray, ch: str, name: Optional[str] = None) -> None:
+        color = self._color_for_channel(ch)
+        style = self.channel_styles.get(ch, self.plot_style)
+        if style == "scatter":
+            plot.plot(
+                time,
+                values,
+                pen=None,
+                symbol="o",
+                symbolSize=6,
+                symbolPen=pg.mkPen(color=color, width=0.8),
+                symbolBrush=pg.mkBrush(color),
+                name=name,
+            )
+        elif style == "area":
+            plot.plot(
+                time,
+                values,
+                pen=pg.mkPen(color=color, width=1.2),
+                brush=pg.mkBrush(color[0], color[1], color[2], 80),
+                fillLevel=0,
+                name=name,
+            )
+        else:  # line
+            plot.plot(time, values, pen=pg.mkPen(color=color, width=1.2), name=name)
+
+    def _draw_seasonal(self, time: np.ndarray) -> None:
+        base = time - float(time.min())
+        period = max(self.season_period, 1e-9)
+        season_ids = np.floor(base / period).astype(int)
+        t_mod = np.mod(base, period)
+        unique_seasons = np.unique(season_ids)
+        # disable hover in seasonal view to avoid ambiguous nearest points
+        self.time_values = np.array([])
+        if self.overlay_mode:
+            p = self.widget.addPlot(row=0, col=0)
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setLabel("left", "Signals")
+            p.setLabel("bottom", "Time within period (s)")
+            legend = p.addLegend()
+            for ch in self.channels:
+                if ch not in self.data.columns:
+                    continue
+                vals = self.data[ch].values
+                color = self._color_for_channel(ch)
+                for idx, sid in enumerate(unique_seasons):
+                    mask = season_ids == sid
+                    if np.count_nonzero(mask) < 2:
+                        continue
+                    p.plot(
+                        t_mod[mask],
+                        vals[mask],
+                        pen=pg.mkPen((color[0], color[1], color[2], 180), width=1.0),
+                        name=ch if idx == 0 else None,
+                    )
+            self._style_axes(p)
+            self.plots.append(p)
+            self.plot_channels[p] = []
+        else:
+            for row, ch in enumerate(self.channels):
+                if ch not in self.data.columns:
+                    continue
+                p = self.widget.addPlot(row=row, col=0)
+                p.showGrid(x=True, y=True, alpha=0.3)
+                p.setLabel("left", ch)
+                p.setLabel("bottom", "Time within period (s)")
+                vals = self.data[ch].values
+                color = self._color_for_channel(ch)
+                for sid in unique_seasons:
+                    mask = season_ids == sid
+                    if np.count_nonzero(mask) < 2:
+                        continue
+                    p.plot(
+                        t_mod[mask],
+                        vals[mask],
+                        pen=pg.mkPen((color[0], color[1], color[2], 180), width=1.0),
+                    )
+                if row > 0 and self.plots:
+                    p.setXLink(self.plots[0])
+                self._style_axes(p)
+                self.plots.append(p)
+                self.plot_channels[p] = []
+
+    def _draw_heatmap(self, time: np.ndarray) -> None:
+        # disable hover for heatmap view
+        self.time_values = np.array([])
+        p = self.widget.addPlot(row=0, col=0)
+        p.showGrid(x=True, y=True, alpha=0.15)
+        p.setLabel("left", "Channels")
+        p.setLabel("bottom", "Time (s)")
+        matrices: List[np.ndarray] = []
+        ticks: List[Tuple[float, str]] = []
+        for idx, ch in enumerate(self.channels):
+            if ch not in self.data.columns:
+                continue
+            matrices.append(self.data[ch].to_numpy())
+            ticks.append((idx + 0.5, ch))
+        if not matrices:
+            self.plots.append(p)
+            self.plot_channels[p] = []
+            return
+        img_array = np.vstack(matrices)
+        img_array = np.nan_to_num(img_array, nan=0.0)
+        span = float(time.max() - time.min()) if len(time) else 1.0
+        span = max(span, 1e-6)
+        img_item = pg.ImageItem(img_array)
+        img_item.setRect(QtCore.QRectF(float(time.min()), 0.0, span, len(matrices)))
+        p.addItem(img_item)
+        left_axis = p.getAxis("left")
+        left_axis.setTicks([ticks, []])
+        p.setYRange(0, len(matrices))
+        self._style_axes(p)
+        self.plots.append(p)
+        self.plot_channels[p] = []
 

@@ -300,33 +300,52 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     def channel_groups(self) -> Dict[str, List[str]]:
         groups: Dict[str, List[str]] = {
+            "Time / LSL": [],
             "Gaze": [],
             "Head": [],
-            "Torso": [],
+            "Chest/Torso": [],
             "Feet": [],
             "Chair": [],
-            "GMM": [],
+            "Workspace": [],
+            "Screen": [],
+            "Position": [],
+            "Orientation/Quat": [],
+            "Fixation": [],
             "Other": [],
         }
+
+        def assign(col: str, name: str) -> None:
+            # helper to append to group map
+            groups[name].append(col)
+
         for col in self.signal_columns:
-            name = col.lower()
-            if "gaze" in name:
-                groups["Gaze"].append(col)
-            elif "head" in name:
-                groups["Head"].append(col)
-            elif "chest" in name:
-                groups["Chest"].append(col)
-            elif "left_foot" in name:
-                groups["Left Foot"].append(col)
-            elif "right_foot" in name:
-                groups["Right Foot"].append(col)
+            name = col.lower().replace(" ", "_")
+            if any(tok in name for tok in ["normalized_time", "timestamp", "lsl"]):
+                assign(col, "Time / LSL")
+            elif "gaze" in name:
+                assign(col, "Gaze")
+            elif "head" in name or "mocap_head" in name:
+                assign(col, "Head")
+            elif "chest" in name or "torso" in name:
+                assign(col, "Chest/Torso")
+            elif "foot" in name:
+                assign(col, "Feet")
             elif "chair" in name:
-                groups["Chair"].append(col)
-            elif "gmm" in name:
-                groups["GMM"].append(col)
+                assign(col, "Chair")
+            elif "workspace" in name:
+                assign(col, "Workspace")
+            elif "screen" in name:
+                assign(col, "Screen")
+            elif "fix" in name:
+                assign(col, "Fixation")
+            elif name.endswith(("_x", "_y", "_z")) or any(s in name for s in ["_x_", "_y_", "_z_"]):
+                assign(col, "Position")
+            elif any(tok in name for tok in ["quat", "qx", "qy", "qz", "qw", "azimuth", "elevation", "angle"]):
+                assign(col, "Orientation/Quat")
             else:
-                groups["Other"].append(col)
-        return groups
+                assign(col, "Other")
+        # prune empty groups for cleaner UI
+        return {k: v for k, v in groups.items() if v}
 
     def take_time_slice(self, start: float, end: float) -> pd.DataFrame:
         df = self.get_dataframe()
@@ -346,4 +365,3 @@ class DataModel(QtCore.QObject):
     def set_sample_rate(self, fs: float) -> None:
         self.sample_rate = float(fs)
         self.statusMessage.emit(f"Sampling rate set to {self.sample_rate} Hz")
-

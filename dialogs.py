@@ -12,6 +12,43 @@ from data_model import AnnotationSegment
 from filter_engine import available_filters
 
 
+FILTER_PARAM_MAP: Dict[str, List[str]] = {
+    "moving_average": ["window"],
+    "median": ["window"],
+    "savgol": ["window", "polyorder"],
+    "butter_lowpass": ["cutoff", "order"],
+    "butter_bandpass": ["low_cut", "high_cut", "order"],
+    "detrend": [],
+    "resample": ["target_fs"],
+    "interpolate": ["method"],
+    "derivative": [],
+    "integrate": [],
+    "normalize_zscore": [],
+    "normalize_percent": [],
+    "moving_rms": ["window"],
+    "absolute": [],
+}
+
+FILTER_DESCRIPTIONS: Dict[str, str] = {
+    "moving_average": "Centered rolling mean smoothing; window is the number of samples.",
+    "median": "Rolling median to suppress spikes; window is the number of samples.",
+    "savgol": "Savitzky-Golay smoothing that preserves peaks; use an odd window and set polynomial order.",
+    "butter_lowpass": "Butterworth low-pass filter; set cutoff frequency in Hz and filter order.",
+    "butter_bandpass": "Butterworth band-pass filter; set low/high cutoff frequencies in Hz and filter order.",
+    "detrend": "Remove a linear trend from the signal.",
+    "resample": "Interpolate the entire trial to a new sampling rate.",
+    "interpolate": "Fill gaps using the selected interpolation method.",
+    "derivative": "First derivative (rate of change) based on the sample rate.",
+    "integrate": "Cumulative integral of the signal.",
+    "normalize_zscore": "Normalize to zero mean and unit variance.",
+    "normalize_percent": "Scale to +/-100 based on the maximum absolute value.",
+    "moving_rms": "Rolling RMS envelope; window controls smoothing in samples.",
+    "absolute": "Absolute value of the signal.",
+}
+
+INTERPOLATE_METHODS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
+
+
 class FilterDialog(QtWidgets.QDialog):
     def __init__(self, channels: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,35 +79,43 @@ class FilterDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout()
         self.filter_combo = QtWidgets.QComboBox()
         self.filter_combo.addItems(available_filters())
+        self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         form.addRow("Filter type", self.filter_combo)
+        self.param_rows: Dict[str, Tuple[QtWidgets.QLabel, QtWidgets.QWidget]] = {}
         self.window_spin = QtWidgets.QSpinBox()
         self.window_spin.setRange(3, 1001)
         self.window_spin.setValue(11)
-        form.addRow("Window", self.window_spin)
+        self._add_param_row(form, "Window (samples)", self.window_spin, "window")
         self.poly_spin = QtWidgets.QSpinBox()
         self.poly_spin.setRange(1, 5)
         self.poly_spin.setValue(2)
-        form.addRow("Poly order", self.poly_spin)
+        self._add_param_row(form, "Poly order", self.poly_spin, "polyorder")
         self.cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.cutoff_spin.setRange(0.1, 60.0)
         self.cutoff_spin.setDecimals(2)
         self.cutoff_spin.setValue(6.0)
-        form.addRow("Low cutoff (Hz)", self.cutoff_spin)
+        self._add_param_row(form, "Low cutoff (Hz)", self.cutoff_spin, "cutoff")
         self.high_cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.high_cutoff_spin.setRange(0.1, 60.0)
         self.high_cutoff_spin.setDecimals(2)
         self.high_cutoff_spin.setValue(10.0)
-        form.addRow("High cutoff (Hz)", self.high_cutoff_spin)
+        self._add_param_row(form, "High cutoff (Hz)", self.high_cutoff_spin, "high_cut")
         self.order_spin = QtWidgets.QSpinBox()
         self.order_spin.setRange(1, 6)
         self.order_spin.setValue(2)
-        form.addRow("Order", self.order_spin)
+        self._add_param_row(form, "Order", self.order_spin, "order")
         self.target_fs_spin = QtWidgets.QDoubleSpinBox()
         self.target_fs_spin.setRange(1.0, 1000.0)
         self.target_fs_spin.setDecimals(2)
         self.target_fs_spin.setValue(60.0)
-        form.addRow("Target fs (Hz)", self.target_fs_spin)
+        self._add_param_row(form, "Target fs (Hz)", self.target_fs_spin, "target_fs")
+        self.method_combo = QtWidgets.QComboBox()
+        self.method_combo.addItems(INTERPOLATE_METHODS)
+        self._add_param_row(form, "Interpolation", self.method_combo, "method")
         layout.addLayout(form)
+        self.filter_help = QtWidgets.QLabel()
+        self.filter_help.setWordWrap(True)
+        layout.addWidget(self.filter_help)
         self.apply_selection_chk = QtWidgets.QCheckBox("Only apply to current selection")
         layout.addWidget(self.apply_selection_chk)
         btns = QtWidgets.QDialogButtonBox()
@@ -81,6 +126,7 @@ class FilterDialog(QtWidgets.QDialog):
         btns.rejected.connect(self.reject)
         self.preview_btn.clicked.connect(self._preview)
         layout.addWidget(btns)
+        self._on_filter_changed(self.filter_combo.currentText())
 
     def selected_channels(self) -> List[str]:
         chans: List[str] = []
@@ -91,22 +137,52 @@ class FilterDialog(QtWidgets.QDialog):
         return chans
 
     def parameters(self) -> Dict:
-        return {
+        filter_type = self.filter_combo.currentText()
+        params: Dict[str, object] = {
             "preset": self.preset_combo.currentText(),
-            "filter": self.filter_combo.currentText(),
-            "window": self.window_spin.value(),
-            "polyorder": self.poly_spin.value(),
-            "cutoff": self.cutoff_spin.value(),
-            "high_cut": self.high_cutoff_spin.value(),
-            "order": self.order_spin.value(),
-            "target_fs": self.target_fs_spin.value(),
+            "filter": filter_type,
             "apply_selection": self.apply_selection_chk.isChecked(),
             "preview": self.preview_requested,
         }
+        for key in FILTER_PARAM_MAP.get(filter_type, []):
+            params[key] = self._param_value(key)
+        return params
 
     def _preview(self) -> None:
         self.preview_requested = True
         self.accept()
+
+    def _add_param_row(self, form: QtWidgets.QFormLayout, label_text: str, widget: QtWidgets.QWidget, key: str) -> None:
+        label = QtWidgets.QLabel(label_text)
+        form.addRow(label, widget)
+        self.param_rows[key] = (label, widget)
+
+    def _on_filter_changed(self, filter_type: str) -> None:
+        needed = set(FILTER_PARAM_MAP.get(filter_type, []))
+        for key, (label, widget) in self.param_rows.items():
+            visible = key in needed
+            label.setVisible(visible)
+            widget.setVisible(visible)
+        self.filter_help.setText(FILTER_DESCRIPTIONS.get(filter_type, ""))
+
+    def _param_value(self, key: str):
+        if key == "window":
+            return self.window_spin.value()
+        if key == "polyorder":
+            return self.poly_spin.value()
+        if key == "cutoff":
+            return self.cutoff_spin.value()
+        if key == "high_cut":
+            return self.high_cutoff_spin.value()
+        if key == "low_cut":
+            return self.cutoff_spin.value()
+        if key == "order":
+            return self.order_spin.value()
+        if key == "target_fs":
+            return self.target_fs_spin.value()
+        if key == "method":
+            return self.method_combo.currentText()
+        return None
 
     def _apply_preset(self) -> None:
         preset = self.preset_combo.currentText()
@@ -158,35 +234,43 @@ class FilterPanel(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout()
         self.filter_combo = QtWidgets.QComboBox()
         self.filter_combo.addItems(available_filters())
+        self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         form.addRow("Filter type", self.filter_combo)
+        self.param_rows: Dict[str, Tuple[QtWidgets.QLabel, QtWidgets.QWidget]] = {}
         self.window_spin = QtWidgets.QSpinBox()
         self.window_spin.setRange(3, 1001)
         self.window_spin.setValue(11)
-        form.addRow("Window", self.window_spin)
+        self._add_param_row(form, "Window (samples)", self.window_spin, "window")
         self.poly_spin = QtWidgets.QSpinBox()
         self.poly_spin.setRange(1, 5)
         self.poly_spin.setValue(2)
-        form.addRow("Poly order", self.poly_spin)
+        self._add_param_row(form, "Poly order", self.poly_spin, "polyorder")
         self.cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.cutoff_spin.setRange(0.1, 60.0)
         self.cutoff_spin.setDecimals(2)
         self.cutoff_spin.setValue(6.0)
-        form.addRow("Low cutoff (Hz)", self.cutoff_spin)
+        self._add_param_row(form, "Low cutoff (Hz)", self.cutoff_spin, "cutoff")
         self.high_cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.high_cutoff_spin.setRange(0.1, 60.0)
         self.high_cutoff_spin.setDecimals(2)
         self.high_cutoff_spin.setValue(10.0)
-        form.addRow("High cutoff (Hz)", self.high_cutoff_spin)
+        self._add_param_row(form, "High cutoff (Hz)", self.high_cutoff_spin, "high_cut")
         self.order_spin = QtWidgets.QSpinBox()
         self.order_spin.setRange(1, 6)
         self.order_spin.setValue(2)
-        form.addRow("Order", self.order_spin)
+        self._add_param_row(form, "Order", self.order_spin, "order")
         self.target_fs_spin = QtWidgets.QDoubleSpinBox()
         self.target_fs_spin.setRange(1.0, 1000.0)
         self.target_fs_spin.setDecimals(2)
         self.target_fs_spin.setValue(60.0)
-        form.addRow("Target fs (Hz)", self.target_fs_spin)
+        self._add_param_row(form, "Target fs (Hz)", self.target_fs_spin, "target_fs")
+        self.method_combo = QtWidgets.QComboBox()
+        self.method_combo.addItems(INTERPOLATE_METHODS)
+        self._add_param_row(form, "Interpolation", self.method_combo, "method")
         layout.addLayout(form)
+        self.filter_help = QtWidgets.QLabel()
+        self.filter_help.setWordWrap(True)
+        layout.addWidget(self.filter_help)
         self.apply_selection_chk = QtWidgets.QCheckBox("Only apply to current selection")
         layout.addWidget(self.apply_selection_chk)
         btns = QtWidgets.QHBoxLayout()
@@ -201,6 +285,7 @@ class FilterPanel(QtWidgets.QWidget):
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
         self.select_all_btn.clicked.connect(self.select_all_channels)
         self.unselect_all_btn.clicked.connect(self.unselect_all_channels)
+        self._on_filter_changed(self.filter_combo.currentText())
 
     def set_channels(self, channels: List[str]) -> None:
         self.list_widget.clear()
@@ -230,18 +315,16 @@ class FilterPanel(QtWidgets.QWidget):
                 item.setCheckState(QtCore.Qt.CheckState.Unchecked)
 
     def parameters(self, preview: bool = False) -> Dict:
-        return {
+        filter_type = self.filter_combo.currentText()
+        params: Dict[str, object] = {
             "preset": self.preset_combo.currentText(),
-            "filter": self.filter_combo.currentText(),
-            "window": self.window_spin.value(),
-            "polyorder": self.poly_spin.value(),
-            "cutoff": self.cutoff_spin.value(),
-            "high_cut": self.high_cutoff_spin.value(),
-            "order": self.order_spin.value(),
-            "target_fs": self.target_fs_spin.value(),
+            "filter": filter_type,
             "apply_selection": self.apply_selection_chk.isChecked(),
             "preview": preview,
         }
+        for key in FILTER_PARAM_MAP.get(filter_type, []):
+            params[key] = self._param_value(key)
+        return params
 
     def _apply_preset(self) -> None:
         preset = self.preset_combo.currentText()
@@ -258,6 +341,38 @@ class FilterPanel(QtWidgets.QWidget):
             self.target_fs_spin.setValue(60.0)
         elif preset == "Normalize z-score":
             self.filter_combo.setCurrentText("normalize_zscore")
+
+    def _add_param_row(self, form: QtWidgets.QFormLayout, label_text: str, widget: QtWidgets.QWidget, key: str) -> None:
+        label = QtWidgets.QLabel(label_text)
+        form.addRow(label, widget)
+        self.param_rows[key] = (label, widget)
+
+    def _on_filter_changed(self, filter_type: str) -> None:
+        needed = set(FILTER_PARAM_MAP.get(filter_type, []))
+        for key, (label, widget) in self.param_rows.items():
+            visible = key in needed
+            label.setVisible(visible)
+            widget.setVisible(visible)
+        self.filter_help.setText(FILTER_DESCRIPTIONS.get(filter_type, ""))
+
+    def _param_value(self, key: str):
+        if key == "window":
+            return self.window_spin.value()
+        if key == "polyorder":
+            return self.poly_spin.value()
+        if key == "cutoff":
+            return self.cutoff_spin.value()
+        if key == "high_cut":
+            return self.high_cutoff_spin.value()
+        if key == "low_cut":
+            return self.cutoff_spin.value()
+        if key == "order":
+            return self.order_spin.value()
+        if key == "target_fs":
+            return self.target_fs_spin.value()
+        if key == "method":
+            return self.method_combo.currentText()
+        return None
 
 
 class AnnotationTable(QtWidgets.QTableWidget):
@@ -442,27 +557,51 @@ class MappingDialog(QtWidgets.QDialog):
     def __init__(self, columns: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("3D Mapping")
-        layout = QtWidgets.QFormLayout(self)
-        self.inputs: Dict[str, QtWidgets.QLineEdit] = {}
-        for part in ["Head", "Torso", "Chair", "Left Foot", "Right Foot"]:
-            edit = QtWidgets.QLineEdit()
-            edit.setPlaceholderText("x,y,z columns e.g. head_x,head_y,head_z")
-            layout.addRow(part, edit)
-            self.inputs[part.lower().replace(" ", "_")] = edit
+        layout = QtWidgets.QGridLayout(self)
+        headers = ["Part", "Position (x,y,z)", "Orientation quat (qx,qy,qz,qw)", "Direction vec (dx,dy,dz, optional)"]
+        for col, hdr in enumerate(headers):
+            layout.addWidget(QtWidgets.QLabel(f"<b>{hdr}</b>"), 0, col)
+        self.inputs: Dict[str, Dict[str, QtWidgets.QLineEdit]] = {}
+        parts = ["Head", "Torso", "Chair", "Left Foot", "Right Foot", "Workspace", "Screen"]
+        for row, part in enumerate(parts, start=1):
+            layout.addWidget(QtWidgets.QLabel(part), row, 0)
+            pos = QtWidgets.QLineEdit()
+            pos.setPlaceholderText("e.g. Head_x,Head_y,Head_z")
+            quat = QtWidgets.QLineEdit()
+            quat.setPlaceholderText("e.g. Mocap_Head_qx,...")
+            direction = QtWidgets.QLineEdit()
+            direction.setPlaceholderText("optional: dir_x,dir_y,dir_z")
+            layout.addWidget(pos, row, 1)
+            layout.addWidget(quat, row, 2)
+            layout.addWidget(direction, row, 3)
+            key = part.lower().replace(" ", "_")
+            self.inputs[key] = {"pos": pos, "quat": quat, "dir": direction}
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        layout.addRow(btns)
+        layout.addWidget(btns, len(parts) + 1, 0, 1, len(headers))
 
     def mapping(self) -> Dict[str, Dict[str, str]]:
         mapping: Dict[str, Dict[str, str]] = {}
-        for key, edit in self.inputs.items():
-            txt = edit.text().strip()
-            if not txt:
-                continue
-            parts = [p.strip() for p in txt.split(",") if p.strip()]
-            if len(parts) == 3:
-                mapping[key] = {"x": parts[0], "y": parts[1], "z": parts[2]}
+        for key, fields in self.inputs.items():
+            pos_txt = fields["pos"].text().strip()
+            quat_txt = fields["quat"].text().strip()
+            dir_txt = fields["dir"].text().strip()
+            entry: Dict[str, str] = {}
+            if pos_txt:
+                parts = [p.strip() for p in pos_txt.split(",") if p.strip()]
+                if len(parts) == 3:
+                    entry.update({"x": parts[0], "y": parts[1], "z": parts[2]})
+            if quat_txt:
+                parts = [p.strip() for p in quat_txt.split(",") if p.strip()]
+                if len(parts) == 4:
+                    entry.update({"qx": parts[0], "qy": parts[1], "qz": parts[2], "qw": parts[3]})
+            if dir_txt:
+                parts = [p.strip() for p in dir_txt.split(",") if p.strip()]
+                if len(parts) == 3:
+                    entry.update({"dx": parts[0], "dy": parts[1], "dz": parts[2]})
+            if entry:
+                mapping[key] = entry
         return mapping
 
 
