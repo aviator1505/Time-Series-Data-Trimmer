@@ -173,9 +173,18 @@ class DataModel(QtCore.QObject):
             return
         self._push_state()
         mask = (self.df["normalized_time"] < start) | (self.df["normalized_time"] > end)
-        new_df = self.df.loc[mask].reset_index(drop=True)
-        n = len(new_df)
-        new_df["normalized_time"] = np.arange(n) / self.sample_rate
+        new_df = self.df.loc[mask].copy().reset_index(drop=True)
+        # recompute time using observed spacing (millisecond precision)
+        dt = 1.0 / max(self.sample_rate, 1e-6)
+        if "normalized_time" in new_df.columns and len(new_df) > 1:
+            diffs = np.diff(new_df["normalized_time"].to_numpy())
+            valid = diffs[diffs > 0]
+            if valid.size:
+                dt = float(np.median(valid))
+        dt = round(dt, 3)  # millisecond precision
+        new_time = np.round(np.arange(len(new_df)) * dt, 3)
+        new_df["normalized_time"] = new_time
+        self.sample_rate = round(1.0 / max(dt, 1e-6), 3)
         self.df = new_df
         self.deletions.append((start, end))
         self.history.append(OperationRecord("delete_segment", {"deleted_samples": (~mask).sum()}, start, end))
