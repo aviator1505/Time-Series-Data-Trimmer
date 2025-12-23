@@ -1,11 +1,12 @@
 """2D plotting controller built on pyqtgraph."""
 from __future__ import annotations
 
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt6 import QtCore, QtGui
+from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from data_model import AnnotationSegment
@@ -29,6 +30,7 @@ class PlotController2D:
         self.selection_callback = None
         self.overlay_mode: bool = False
         self.annotation_drag_callback = None
+        self._annotations_draggable: bool = False  # Only enabled in Edit mode
         self.hover_label = pg.TextItem(
             "",
             anchor=(0, 1),
@@ -41,6 +43,8 @@ class PlotController2D:
         self.hover_dot = pg.ScatterPlotItem(
             size=8, pen=pg.mkPen((40, 40, 40), width=1.2), brush=pg.mkBrush(255, 255, 255), pxMode=True
         )
+        # Workaround for pyqtgraph 0.14.0 bug: PlotItem.updateAlpha calls setAlpha on all items
+        self.hover_dot.setAlpha = lambda *args, **kwargs: None
         self.hover_dot.setZValue(19)
         self.hover_dot.setVisible(False)
         scene = self.widget.scene()
@@ -194,12 +198,21 @@ class PlotController2D:
             except Exception:
                 pass
             base_brush = pg.mkBrush(color)
-            reg = pg.LinearRegionItem(values=(ann.start, ann.end), brush=base_brush, movable=True)
+            reg = pg.LinearRegionItem(values=(ann.start, ann.end), brush=base_brush,
+                                      movable=self._annotations_draggable)
             reg.setZValue(-12)
             reg.annot_id = getattr(ann, "id", None)
             reg.annot_track = ann.track
             reg._base_brush = base_brush  # type: ignore[attr-defined]
-            reg.sigRegionChangeFinished.connect(self._on_region_dragged)  # type: ignore
+            # Enhanced edge handles - more visible with hover effect
+            for line in reg.lines:
+                line.setPen(pg.mkPen(color=(255, 255, 255), width=2))
+                line.setHoverPen(pg.mkPen(color=(255, 200, 0), width=3))
+                line.setMovable(self._annotations_draggable)
+            # Connect signals for live sync and final update (use partial to pass region)
+            reg.sigRegionChanged.connect(partial(self._on_region_dragging, reg))  # type: ignore
+            reg.sigRegionChangeFinished.connect(partial(self._on_region_dragged, reg))  # type: ignore
+            self._setup_region_modifiers(reg)
             self.annotation_regions.append(reg)
             for idx, p in enumerate(self.plots):
                 if idx == 0:
@@ -241,6 +254,32 @@ class PlotController2D:
                     break
             except Exception:
                 continue
+
+    def set_annotations_draggable(self, draggable: bool) -> None:
+        """Enable/disable annotation region dragging.
+
+        When disabled (Trim/Annotate modes), annotation regions ignore drags.
+        When enabled (Edit mode), annotation regions can be dragged to adjust.
+        """
+        self._annotations_draggable = draggable
+        for reg in self.annotation_regions:
+            reg.setMovable(draggable)
+            # Also toggle line movability for edge handles
+            for line in reg.lines:
+                line.setMovable(draggable)
+
+    def set_annotations_visible(self, visible: bool) -> None:
+        """Show/hide all annotation and deletion regions."""
+        for reg in self.annotation_regions + self.annotation_clone_regions:
+            try:
+                reg.setVisible(visible)
+            except Exception:
+                pass
+        for reg in self.deletion_regions:
+            try:
+                reg.setVisible(visible)
+            except Exception:
+                pass
 
     def set_selection_callback(self, cb) -> None:
         """Register a callback receiving (start, end) when user drags selection."""
@@ -388,22 +427,70 @@ class PlotController2D:
             new_right = new_left + cur_width
         vb.setXRange(new_left, new_right, padding=0.0)
 
-    def _on_region_dragged(self) -> None:
-        """Forward draggable region changes back to callback for live updates."""
-        if self.selection_callback is None and self.annotation_drag_callback is None:
+    def _on_region_dragging(self, reg: pg.LinearRegionItem) -> None:
+        """Live sync clones while dragging (no model update yet)."""
+        ann_id = getattr(reg, "annot_id", None)
+        if ann_id is None:
             return
-        for reg in self.annotation_regions:
-            start, end = reg.getRegion()
-            for clone in self.annotation_clone_regions:
-                if getattr(clone, "annot_id", None) == getattr(reg, "annot_id", None):
-                    try:
-                        clone.setRegion((start, end))
-                    except Exception:
-                        pass
-            if self.annotation_drag_callback and getattr(reg, "annot_id", None) is not None:
-                self.annotation_drag_callback(reg.annot_id, start, end)
+
+        start, end = reg.getRegion()
+
+        # Only sync clones visually, don't update model
+        for clone in self.annotation_clone_regions:
+            if getattr(clone, "annot_id", None) == ann_id:
+                try:
+                    clone.setRegion((start, end))
+                except Exception:
+                    pass
+
+    def _on_region_dragged(self, reg: pg.LinearRegionItem) -> None:
+        """Handle drag completion for a single annotation region."""
+        ann_id = getattr(reg, "annot_id", None)
+        if ann_id is None:
+            return
+
+        start, end = reg.getRegion()
+
+        # Sync clone regions for this specific annotation
+        for clone in self.annotation_clone_regions:
+            if getattr(clone, "annot_id", None) == ann_id:
+                try:
+                    clone.setRegion((start, end))
+                except Exception:
+                    pass
+
+        # Call the callback only for the dragged annotation
+        if self.annotation_drag_callback:
+            self.annotation_drag_callback(ann_id, start, end)
+
+    def _setup_region_modifiers(self, reg: pg.LinearRegionItem) -> None:
+        """Configure keyboard modifier behavior for edge-only dragging.
+
+        - Shift + drag: Move only start edge (left)
+        - Ctrl + drag: Move only end edge (right)
+        - No modifier: Move entire region (both edges together)
+        """
+        original_mouseDrag = reg.mouseDragEvent
+
+        def modified_mouseDrag(ev):
+            modifiers = QtWidgets.QApplication.keyboardModifiers()
+
+            if modifiers == QtCore.Qt.KeyboardModifier.ShiftModifier:
+                # Shift: only move left edge (start)
+                reg.lines[0].setMovable(True)
+                reg.lines[1].setMovable(False)
+            elif modifiers == QtCore.Qt.KeyboardModifier.ControlModifier:
+                # Ctrl: only move right edge (end)
+                reg.lines[0].setMovable(False)
+                reg.lines[1].setMovable(True)
             else:
-                self.selection_callback(start, end)
+                # No modifier: move both (entire region)
+                reg.lines[0].setMovable(True)
+                reg.lines[1].setMovable(True)
+
+            original_mouseDrag(ev)
+
+        reg.mouseDragEvent = modified_mouseDrag
 
     def set_annotation_drag_callback(self, cb) -> None:
         self.annotation_drag_callback = cb

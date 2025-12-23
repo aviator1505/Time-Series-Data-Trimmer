@@ -25,6 +25,7 @@ class AnnotationSegment:
     track: str = "default"
     color: str = "#4e79a7"
     id: int = field(default_factory=int)
+    episode_index: Optional[int] = None  # Manual episode index override for CSV export
 
 
 @dataclass
@@ -210,6 +211,10 @@ class DataModel(QtCore.QObject):
             self.statusMessage.emit("Invalid annotation range")
             return
         self._push_state()
+        # Ensure unique ID by finding max existing ID
+        if self.annotations:
+            max_existing_id = max(a.id for a in self.annotations)
+            self._id_counter = max(self._id_counter, max_existing_id + 1)
         ann = AnnotationSegment(start=start, end=end, label=label, track=track, color=color, id=self._id_counter)
         self._id_counter += 1
         self.annotations.append(ann)
@@ -218,7 +223,16 @@ class DataModel(QtCore.QObject):
         self.historyChanged.emit()
         self.statusMessage.emit(f"Annotated {start:.3f}-{end:.3f} s as {label}")
 
-    def update_annotation(self, ann_id: int, start: float, end: float, label: Optional[str], track: Optional[str], color: Optional[str]) -> None:
+    def update_annotation(
+        self,
+        ann_id: int,
+        start: float,
+        end: float,
+        label: Optional[str],
+        track: Optional[str],
+        color: Optional[str],
+        episode_index: Optional[int] = None
+    ) -> None:
         for ann in self.annotations:
             if ann.id == ann_id:
                 ann.start = start
@@ -229,6 +243,8 @@ class DataModel(QtCore.QObject):
                     ann.track = track
                 if color is not None:
                     ann.color = color
+                # episode_index can be set to None (auto) or a specific value
+                ann.episode_index = episode_index
                 self.annotationsChanged.emit()
                 self.statusMessage.emit(f"Updated annotation {ann_id}")
                 break
@@ -249,11 +265,33 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
-    def save_clean(self, path: str) -> None:
+    def save_clean(
+        self,
+        path: str,
+        embed_annotations: bool = True,
+        manual_indices: Optional[Dict[int, int]] = None
+    ) -> None:
+        """Save cleaned DataFrame to CSV, optionally embedding annotations.
+
+        Args:
+            path: Output file path
+            embed_annotations: If True, write annotations as episode columns
+            manual_indices: Optional dict mapping annotation.id -> desired episode_index
+        """
         if self.df is None:
             self.statusMessage.emit("No data to save")
             return
-        self.df.to_csv(path, index=False)
+
+        output_df = self.df.copy()
+
+        if embed_annotations and self.annotations:
+            output_df = self.annotations_to_episode_columns(
+                output_df,
+                self.annotations,
+                manual_indices
+            )
+
+        output_df.to_csv(path, index=False)
         self.statusMessage.emit(f"Saved cleaned CSV to {path}")
 
     def save_annotations(self, path: str) -> None:
@@ -303,6 +341,140 @@ class DataModel(QtCore.QObject):
         self.annotationsChanged.emit()
         self.historyChanged.emit()
         self.statusMessage.emit(f"Loaded annotations from {path}")
+
+    # ------------------------------------------------------------------
+    # Episode column conversion (annotations <-> CSV columns)
+    # ------------------------------------------------------------------
+    def _parse_annotation_label(self, label: str) -> Tuple[str, str]:
+        """Parse annotation label into (episode_type, episode_state).
+
+        Handles formats:
+        - "episode:inspection:inspecting_screen" -> ("inspection", "inspecting_screen")
+        - "episode:action" -> ("action", "")
+        - "blink" -> ("blink", "")  # Non-standard labels become type
+        """
+        if label.startswith("episode:"):
+            parts = label.split(":", 2)  # Split into at most 3 parts
+            if len(parts) >= 3:
+                return (parts[1], parts[2])
+            elif len(parts) == 2:
+                return (parts[1], "")
+        # Non-episode labels: use label as type, empty state
+        return (label, "")
+
+    def _assign_episode_indices(
+        self,
+        annotations: List[AnnotationSegment],
+        manual_indices: Optional[Dict[int, int]] = None
+    ) -> Dict[int, int]:
+        """Assign episode indices to annotations.
+
+        Priority:
+        1. annotation.episode_index if set on the object
+        2. manual_indices dict if provided
+        3. Auto-assign sequential indices by start time
+
+        Args:
+            annotations: List of annotations to assign indices
+            manual_indices: Optional dict mapping annotation.id -> desired episode_index
+
+        Returns:
+            Dict mapping annotation.id -> assigned episode_index
+        """
+        if not annotations:
+            return {}
+
+        # Sort by start time (then by end time for ties)
+        sorted_anns = sorted(annotations, key=lambda a: (a.start, a.end))
+
+        # Build combined manual indices from annotation.episode_index and manual_indices param
+        combined_manual: Dict[int, int] = {}
+        for ann in sorted_anns:
+            if ann.episode_index is not None:
+                combined_manual[ann.id] = ann.episode_index
+        if manual_indices:
+            combined_manual.update(manual_indices)  # Param overrides annotation field
+
+        if not combined_manual:
+            # Auto-assign: sequential indices starting from 1
+            return {ann.id: idx + 1 for idx, ann in enumerate(sorted_anns)}
+
+        # Manual assignment with shifting
+        result: Dict[int, int] = {}
+        used_indices: set = set(combined_manual.values())
+
+        # First pass: assign manual indices
+        for ann_id, desired_idx in combined_manual.items():
+            result[ann_id] = desired_idx
+
+        # Second pass: assign remaining indices, shifting as needed
+        next_available = 1
+        for ann in sorted_anns:
+            if ann.id in result:
+                continue
+            # Find next available index that doesn't conflict
+            while next_available in used_indices:
+                next_available += 1
+            result[ann.id] = next_available
+            used_indices.add(next_available)
+            next_available += 1
+
+        return result
+
+    def annotations_to_episode_columns(
+        self,
+        df: pd.DataFrame,
+        annotations: List[AnnotationSegment],
+        manual_indices: Optional[Dict[int, int]] = None
+    ) -> pd.DataFrame:
+        """Embed annotations as episode columns in DataFrame.
+
+        Creates/overwrites columns:
+        - episode_index: Integer identifier for each episode
+        - episode_type: String label (e.g., "inspection", "action")
+        - episode_state: Optional state descriptor
+
+        Args:
+            df: DataFrame to modify (will be copied)
+            annotations: All annotations to embed
+            manual_indices: Optional dict mapping annotation.id -> desired index
+
+        Returns:
+            Modified DataFrame with episode columns
+        """
+        if df.empty or not annotations:
+            return df.copy()
+
+        result_df = df.copy()
+        time_col = result_df["normalized_time"].values
+
+        # Initialize columns with NaN/empty
+        result_df["episode_index"] = np.nan
+        result_df["episode_type"] = ""
+        result_df["episode_state"] = ""
+
+        # Assign indices
+        index_map = self._assign_episode_indices(annotations, manual_indices)
+
+        # Sort annotations by start time for consistent processing
+        sorted_anns = sorted(annotations, key=lambda a: a.start)
+
+        for ann in sorted_anns:
+            # Find rows within annotation time range
+            mask = (time_col >= ann.start) & (time_col <= ann.end)
+
+            if not mask.any():
+                continue
+
+            episode_idx = index_map[ann.id]
+            episode_type, episode_state = self._parse_annotation_label(ann.label)
+
+            # Assign to matching rows
+            result_df.loc[mask, "episode_index"] = episode_idx
+            result_df.loc[mask, "episode_type"] = episode_type
+            result_df.loc[mask, "episode_state"] = episode_state
+
+        return result_df
 
     # ------------------------------------------------------------------
     # Utility

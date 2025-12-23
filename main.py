@@ -21,7 +21,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
+
+
+class InteractionMode(Enum):
+    """Interaction modes for the 2D plot."""
+    TRIMMING = auto()     # Selection for data deletion/marking
+    ANNOTATION = auto()   # Creating new annotations
+    EDIT = auto()         # Editing existing annotations
 
 import numpy as np
 import pandas as pd
@@ -32,6 +40,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from data_model import AnnotationSegment, DataModel
 from dialogs import (
     AnnotationTable,
+    ExportCSVDialog,
     ExportFigureDialog,
     FilterPanel,
     FilterPreviewDialog,
@@ -199,15 +208,21 @@ class ProjectPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         btns = QtWidgets.QHBoxLayout()
         self.add_btn = QtWidgets.QPushButton("Add trial")
+        self.add_multi_btn = QtWidgets.QPushButton("Add multiple...")
+        self.add_folder_btn = QtWidgets.QPushButton("Add folder...")
         self.save_btn = QtWidgets.QPushButton("Save project")
         btns.addWidget(self.add_btn)
+        btns.addWidget(self.add_multi_btn)
+        btns.addWidget(self.add_folder_btn)
         btns.addWidget(self.save_btn)
         layout.addLayout(btns)
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Path", "Participant", "Condition", "Status", "Summary"])
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels([ "Participant", "Condition", "Angle", "Status", "Summary", "Path"])
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
         self.add_btn.clicked.connect(self.add_trial)
+        self.add_multi_btn.clicked.connect(self.add_trials_multi)
+        self.add_folder_btn.clicked.connect(self.add_trials_folder)
         self.save_btn.clicked.connect(self.project.save)
         self.table.cellDoubleClicked.connect(self._emit_selection)
 
@@ -217,8 +232,9 @@ class ProjectPanel(QtWidgets.QWidget):
             self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(t.path))
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(t.participant))
             self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(t.condition))
-            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(t.status))
-            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(t.summary))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(t.angle) if t.angle else ""))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(t.status))
+            self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(t.summary))
 
     def add_trial(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add trial CSV", "", "CSV files (*.csv)")
@@ -228,6 +244,47 @@ class ProjectPanel(QtWidgets.QWidget):
         condition, _ = QtWidgets.QInputDialog.getText(self, "Condition", "Condition (optional)")
         self.project.add_trial(path, participant, condition)
         self.refresh()
+
+    def add_trials_multi(self) -> None:
+        """Open multi-file dialog and show preview before adding trials."""
+        from dialogs import MultiTrialPreviewDialog
+
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select Trial CSV Files", "", "CSV files (*.csv)"
+        )
+        if not paths:
+            return
+
+        dialog = MultiTrialPreviewDialog(paths, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            entries = dialog.get_trial_entries()
+            self.project.add_trials_bulk(entries)
+            self.refresh()
+
+    def add_trials_folder(self) -> None:
+        """Open folder dialog and add all CSV files within."""
+        from dialogs import MultiTrialPreviewDialog
+        import glob
+        import os
+
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Folder Containing Trial CSVs"
+        )
+        if not folder:
+            return
+
+        paths = sorted(glob.glob(os.path.join(folder, "*.csv")))
+        if not paths:
+            QtWidgets.QMessageBox.information(
+                self, "No Files Found", f"No CSV files found in:\n{folder}"
+            )
+            return
+
+        dialog = MultiTrialPreviewDialog(paths, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            entries = dialog.get_trial_entries()
+            self.project.add_trials_bulk(entries)
+            self.refresh()
 
     def _emit_selection(self, row: int, col: int) -> None:
         if 0 <= row < len(self.project.trials):
@@ -300,7 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.snap_to_index = True
         self.playing = False
         self.selection: Tuple[Optional[float], Optional[float]] = (None, None)
-        self.annotation_mode = False
+        self.interaction_mode = InteractionMode.TRIMMING
         self.last_annotation_label = "event"
         self.suggestion_segments: List[Tuple[float, float, str]] = []
         self.selected_annotation_id: Optional[int] = None
@@ -355,14 +412,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.season_period_spin.setVisible(False)
         self.toolbar.addWidget(self.season_label)
         self.toolbar.addWidget(self.season_period_spin)
-        self.annotation_mode_action = QtGui.QAction("Annotation mode", self)
-        self.annotation_mode_action.setCheckable(True)
-        self.annotation_mode_action.setToolTip("When enabled: click start/end points to create annotations quickly.")
-        self.toolbar.addAction(self.annotation_mode_action)
+        # Mode selection buttons (exclusive toggle group)
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+
+        self.trim_mode_btn = QtWidgets.QToolButton()
+        self.trim_mode_btn.setText("Trim")
+        self.trim_mode_btn.setCheckable(True)
+        self.trim_mode_btn.setChecked(True)
+        self.trim_mode_btn.setToolTip("Selection mode for trimming/deleting data segments (D/M keys)")
+
+        self.annotate_mode_btn = QtWidgets.QToolButton()
+        self.annotate_mode_btn.setText("Annotate")
+        self.annotate_mode_btn.setCheckable(True)
+        self.annotate_mode_btn.setToolTip("Click start/end to create annotations")
+
+        self.edit_mode_btn = QtWidgets.QToolButton()
+        self.edit_mode_btn.setText("Edit")
+        self.edit_mode_btn.setCheckable(True)
+        self.edit_mode_btn.setToolTip("Drag annotations to adjust start/end times")
+
+        self.mode_group.addButton(self.trim_mode_btn, InteractionMode.TRIMMING.value)
+        self.mode_group.addButton(self.annotate_mode_btn, InteractionMode.ANNOTATION.value)
+        self.mode_group.addButton(self.edit_mode_btn, InteractionMode.EDIT.value)
+
+        self.toolbar.addWidget(self.trim_mode_btn)
+        self.toolbar.addWidget(self.annotate_mode_btn)
+        self.toolbar.addWidget(self.edit_mode_btn)
+        self.toolbar.addSeparator()
         self.show_3d_action = QtGui.QAction("Show 3D", self)
         self.show_3d_action.setCheckable(True)
         self.show_3d_action.setChecked(False)
         self.toolbar.addAction(self.show_3d_action)
+        self.show_annotations_action = QtGui.QAction("Annotations", self)
+        self.show_annotations_action.setCheckable(True)
+        self.show_annotations_action.setChecked(True)
+        self.show_annotations_action.setToolTip("Show/hide annotation overlays on plot")
+        self.toolbar.addAction(self.show_annotations_action)
         self.cursor_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.cursor_slider.setRange(0, 1000)
         layout.addWidget(self.cursor_slider)
@@ -491,8 +577,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overlay_action.toggled.connect(self.on_overlay_toggled)
         self.plot_style_combo.currentTextChanged.connect(self.on_plot_style_changed)
         self.season_period_spin.valueChanged.connect(self.on_season_period_changed)
-        self.annotation_mode_action.toggled.connect(self.on_annotation_mode_toggled)
+        self.mode_group.idClicked.connect(self._on_mode_changed)
         self.show_3d_action.toggled.connect(self.toggle_3d_visibility)
+        self.show_annotations_action.toggled.connect(self.toggle_annotations_visibility)
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
         self.cursor_slider.valueChanged.connect(self._on_slider_changed)
         self.snap_index_chk.stateChanged.connect(self._on_snap_changed)
@@ -530,12 +617,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_suggestions()
 
     def on_save_clean(self) -> None:
+        # Show export options dialog if annotations exist
+        embed_annotations = True
+        manual_indices = None
+
+        if self.data_model.annotations:
+            dlg = ExportCSVDialog(self.data_model.annotations, self)
+            if not dlg.exec():
+                return
+            params = dlg.export_params()
+            embed_annotations = params["embed_annotations"]
+            manual_indices = params["manual_indices"]
+
+        # Get save path
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save cleaned CSV", "", "CSV files (*.csv)")
         if not path:
             return
         if not path.lower().endswith(".csv"):
             path += ".csv"
-        self.data_model.save_clean(path)
+
+        # Save with annotation embedding
+        self.data_model.save_clean(path, embed_annotations, manual_indices)
         self.project.update_status(path, "cleaned", "Cleaned CSV saved")
         self.project_panel.refresh()
 
@@ -890,6 +992,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot3d.set_mappings(self.mapping)
             self.plot3d.set_frames(self.frames)
 
+    def toggle_annotations_visibility(self, visible: bool) -> None:
+        """Toggle visibility of annotation overlays on the 2D plot."""
+        self.plot2d.set_annotations_visible(visible)
+        self.statusBar().showMessage(f"Annotations {'shown' if visible else 'hidden'}")
+
     def _on_speed_changed(self, text: str) -> None:
         try:
             self.play_speed = float(text.rstrip("x"))
@@ -914,15 +1021,32 @@ class MainWindow(QtWidgets.QMainWindow):
         t = value / 1000.0 * t_max
         self.set_time_cursor(t)
 
-    def on_annotation_mode_toggled(self, enabled: bool) -> None:
-        self.annotation_mode = enabled
-        # reset any in-progress selection to avoid accidental deletes
+    def _on_mode_changed(self, mode_id: int) -> None:
+        """Handle interaction mode changes."""
+        self.interaction_mode = InteractionMode(mode_id)
+
+        # Reset state when switching modes
         self.selection = (None, None)
         self.plot2d.clear_selection()
-        if enabled:
-            self.statusBar().showMessage("Annotation mode ON: click start then end to create an annotation.")
-        else:
-            self.statusBar().showMessage("Annotation mode OFF")
+
+        # Update plot2d draggability BEFORE refreshing annotations
+        self.plot2d.set_annotations_draggable(self.interaction_mode == InteractionMode.EDIT)
+
+        # Force complete refresh of annotation regions to ensure clean state
+        # This prevents stale event handlers from previous mode from interfering
+        if self.data_model.df is not None:
+            self.plot2d.update_annotations(self.data_model.annotations, self.data_model.deletions)
+            # Respect visibility setting
+            if not self.show_annotations_action.isChecked():
+                self.plot2d.set_annotations_visible(False)
+
+        # Status bar hint
+        hints = {
+            InteractionMode.TRIMMING: "Trim mode: Click start/end to select region, then D=delete, M=mark bad",
+            InteractionMode.ANNOTATION: "Annotate mode: Click start/end to create annotation, Delete=remove selected",
+            InteractionMode.EDIT: "Edit mode: Drag annotations to adjust, Shift+drag=start only, Ctrl+drag=end only",
+        }
+        self.statusBar().showMessage(hints[self.interaction_mode])
 
     def set_time_cursor(self, t: float) -> None:
         self.current_time = float(t)
@@ -946,17 +1070,25 @@ class MainWindow(QtWidgets.QMainWindow):
         mouse_point = vb.mapSceneToView(pos)
         t = float(mouse_point.x())
         t = self._snap_time(t)
-        if self.annotation_mode:
+
+        if self.interaction_mode == InteractionMode.EDIT:
+            # Edit mode: clicks select annotation at time (for deletion etc)
+            self._select_annotation_at_time(t)
+            return
+
+        if self.interaction_mode == InteractionMode.ANNOTATION:
+            # Annotation mode: two clicks create annotation
             if self.selection[0] is None:
                 self.selection = (t, None)
                 self.plot2d.set_selection(t, t + 0.05)
-                self.statusBar().showMessage(f"Annotation start @ {t:.3f}s")
+                self.statusBar().showMessage(f"Annotation start @ {t:.3f}s – click end point")
             else:
                 self.selection = (self.selection[0], t)
                 self._apply_selection_to_view()
                 self._create_annotation_from_selection()
             return
-        # normal selection handling
+
+        # Trimming mode: two clicks set selection for delete/mark
         if self.selection[0] is None:
             self.selection = (t, None)
         elif self.selection[1] is None:
@@ -965,9 +1097,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.selection = (t, None)
         self._draw_markers()
-        ann = self._annotation_at_time(t)
-        if ann:
-            self._select_annotation_in_table(ann.id)
 
     def _snap_time(self, t: float) -> float:
         if self.data_model.df is None:
@@ -1016,20 +1145,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
         key = event.key()
-        if key == QtCore.Qt.Key.Key_D:
-            self.delete_selection()
-        elif key == QtCore.Qt.Key.Key_M:
-            self.mark_bad_selection()
-        elif key == QtCore.Qt.Key.Key_A:
-            self.annotate_selection()
-        elif key == QtCore.Qt.Key.Key_U:
+
+        # Universal: Undo/Redo
+        if key == QtCore.Qt.Key.Key_U:
             self.data_model.undo()
-        elif key == QtCore.Qt.Key.Key_R:
+            return
+        if key == QtCore.Qt.Key.Key_R:
             self.data_model.redo()
-        elif key == QtCore.Qt.Key.Key_Left:
+            return
+
+        # Universal: Arrow keys for time nudge
+        if key == QtCore.Qt.Key.Key_Left:
             self._nudge_time(-1)
-        elif key == QtCore.Qt.Key.Key_Right:
+            return
+        if key == QtCore.Qt.Key.Key_Right:
             self._nudge_time(1)
+            return
+
+        # Mode-specific keys
+        if self.interaction_mode == InteractionMode.TRIMMING:
+            if key == QtCore.Qt.Key.Key_D:
+                self.delete_selection()
+            elif key == QtCore.Qt.Key.Key_M:
+                self.mark_bad_selection()
+            elif key == QtCore.Qt.Key.Key_A:
+                self.annotate_selection()
+            else:
+                super().keyPressEvent(event)
+        elif self.interaction_mode in (InteractionMode.ANNOTATION, InteractionMode.EDIT):
+            if key in (QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace):
+                self.delete_selected_annotation()
+            else:
+                super().keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
@@ -1055,6 +1202,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         matches.sort(key=lambda a: (a.track != "episode", a.end - a.start))
         return matches[0]
+
+    def _select_annotation_at_time(self, t: float) -> None:
+        """Select annotation that contains the given time point (used in Edit mode)."""
+        ann = self._annotation_at_time(t)
+        if ann:
+            self.selected_annotation_id = ann.id
+            self.plot2d.highlight_annotation(ann.id)
+            self._select_annotation_in_table(ann.id)
+            self.statusBar().showMessage(f"Selected: {ann.label} ({ann.start:.2f}s – {ann.end:.2f}s)")
+        else:
+            # No annotation at this time - deselect
+            self.selected_annotation_id = None
+            self.plot2d.highlight_annotation(-1)
+            self.statusBar().showMessage("Edit mode: Click on an annotation to select, then drag to adjust")
 
     def delete_selection(self) -> None:
         sel = self._selection_values()
@@ -1112,6 +1273,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_annotations_changed(self) -> None:
         self.ann_table.populate(self.data_model.annotations)
         self.plot2d.update_annotations(self.data_model.annotations, self.data_model.deletions)
+        # Respect current visibility setting
+        if not self.show_annotations_action.isChecked():
+            self.plot2d.set_annotations_visible(False)
         if self.selected_annotation_id is not None:
             if any(a.id == self.selected_annotation_id for a in self.data_model.annotations):
                 self.plot2d.highlight_annotation(self.selected_annotation_id)
@@ -1201,17 +1365,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 color_row = QtWidgets.QHBoxLayout()
                 color_row.addWidget(color_edit)
                 color_row.addWidget(color_btn)
+                # Episode index with auto checkbox
+                episode_chk = QtWidgets.QCheckBox("Auto")
+                episode_spin = QtWidgets.QSpinBox()
+                episode_spin.setRange(1, 9999)
+                if ann.episode_index is not None:
+                    episode_spin.setValue(ann.episode_index)
+                    episode_chk.setChecked(False)
+                else:
+                    episode_spin.setValue(1)
+                    episode_chk.setChecked(True)
+                episode_spin.setEnabled(not episode_chk.isChecked())
+                episode_chk.toggled.connect(lambda checked: episode_spin.setEnabled(not checked))
+                episode_row = QtWidgets.QHBoxLayout()
+                episode_row.addWidget(episode_spin)
+                episode_row.addWidget(episode_chk)
                 form.addRow("Start", start)
                 form.addRow("End", end)
                 form.addRow("Label", label)
                 form.addRow("Track", track)
                 form.addRow("Color", color_row)
+                form.addRow("Episode Index", episode_row)
                 btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
                 form.addRow(btns)
                 btns.accepted.connect(dlg.accept)
                 btns.rejected.connect(dlg.reject)
                 if dlg.exec():
-                    self.data_model.update_annotation(ann_id, start.value(), end.value(), label.text(), track.text(), color_edit.text())
+                    ep_idx = None if episode_chk.isChecked() else episode_spin.value()
+                    self.data_model.update_annotation(ann_id, start.value(), end.value(), label.text(), track.text(), color_edit.text(), ep_idx)
                 break
 
     def _show_annotation_menu(self, pos: QtCore.QPoint) -> None:
@@ -1226,6 +1407,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if ann_id == -1:
             return
         self.data_model.delete_annotation(ann_id)
+
+    def delete_selected_annotation(self) -> None:
+        """Delete the currently selected annotation via keyboard (Delete/Backspace)."""
+        # Check if we have a plot-selected annotation first
+        if self.selected_annotation_id is not None:
+            self.data_model.delete_annotation(self.selected_annotation_id)
+            self.selected_annotation_id = None
+            self._on_annotations_changed()
+            self.statusBar().showMessage("Annotation deleted")
+            return
+        # Fall back to table selection
+        ann_id = self.ann_table.selected_annotation_id()
+        if ann_id != -1:
+            self.data_model.delete_annotation(ann_id)
+            self._on_annotations_changed()
+            self.statusBar().showMessage("Annotation deleted")
 
     def _on_snap_changed(self) -> None:
         self.snap_to_index = self.snap_index_chk.isChecked()

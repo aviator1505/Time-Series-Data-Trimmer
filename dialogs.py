@@ -723,3 +723,310 @@ class CalibrationWizard(QtWidgets.QDialog):
             "name": self.name_edit.text().strip(),
         }
 
+
+class MultiTrialPreviewDialog(QtWidgets.QDialog):
+    """
+    Preview dialog for multi-file trial selection.
+    Shows parsed metadata in an editable table before confirmation.
+    """
+
+    def __init__(
+        self,
+        file_paths: List[str],
+        parent: QtWidgets.QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Multiple Trials")
+        self.resize(950, 500)
+        self.file_paths = file_paths
+        self._setup_ui()
+        self._populate_table()
+
+    def _setup_ui(self) -> None:
+        """Build the dialog UI."""
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Header
+        header = QtWidgets.QLabel(f"Review {len(self.file_paths)} file(s) before adding:")
+        header.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        layout.addWidget(header)
+
+        # Info label
+        info = QtWidgets.QLabel(
+            "Edit any values as needed. Files that could not be parsed are highlighted."
+        )
+        layout.addWidget(info)
+
+        # Table
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "Filename", "Participant", "Condition",
+            "Trial #", "Session", "Angle", "Status"
+        ])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.table)
+
+        # Buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _populate_table(self) -> None:
+        """Parse filenames and fill the table."""
+        from project_manager import parse_trial_filename
+
+        self.table.setRowCount(len(self.file_paths))
+
+        for row, path in enumerate(self.file_paths):
+            parsed = parse_trial_filename(path)
+
+            # Column 0: Filename (read-only)
+            filename_item = QtWidgets.QTableWidgetItem(parsed.original_filename)
+            filename_item.setFlags(
+                filename_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable
+            )
+            filename_item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+            self.table.setItem(row, 0, filename_item)
+
+            # Column 1: Participant (editable)
+            self.table.setItem(
+                row, 1, QtWidgets.QTableWidgetItem(parsed.participant)
+            )
+
+            # Column 2: Condition (combo box)
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["", "Sit", "Stand", "Swivel", "Other"])
+            if parsed.condition in ["Sit", "Stand", "Swivel"]:
+                combo.setCurrentText(parsed.condition)
+            self.table.setCellWidget(row, 2, combo)
+
+            # Column 3: Trial # (editable)
+            trial_text = str(parsed.trial_number) if parsed.trial_number else ""
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(trial_text))
+
+            # Column 4: Session (editable)
+            session_text = str(parsed.session) if parsed.session else ""
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(session_text))
+
+            # Column 5: Angle (editable)
+            angle_text = str(parsed.angle) if parsed.angle else ""
+            self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(angle_text))
+
+            # Column 6: Status (read-only)
+            status = "Parsed" if parsed.parse_success else "Manual entry needed"
+            status_item = QtWidgets.QTableWidgetItem(status)
+            status_item.setFlags(
+                status_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable
+            )
+            if not parsed.parse_success:
+                status_item.setBackground(QtGui.QColor(255, 255, 200))
+                # Also highlight the row
+                for col in range(6):
+                    item = self.table.item(row, col)
+                    if item:
+                        item.setBackground(QtGui.QColor(255, 255, 200))
+            self.table.setItem(row, 6, status_item)
+
+    def get_trial_entries(self) -> List:
+        """Collect edited values from the table and return TrialEntry objects."""
+        from project_manager import TrialEntry
+
+        entries = []
+        for row in range(self.table.rowCount()):
+            path = self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
+            participant = self.table.item(row, 1).text().strip()
+
+            # Get condition from combo box
+            combo = self.table.cellWidget(row, 2)
+            condition = combo.currentText() if combo else ""
+
+            # Parse numeric fields with fallback
+            try:
+                trial_number = int(self.table.item(row, 3).text())
+            except (ValueError, AttributeError):
+                trial_number = 0
+
+            try:
+                session = int(self.table.item(row, 4).text())
+            except (ValueError, AttributeError):
+                session = 0
+
+            try:
+                angle = int(self.table.item(row, 5).text())
+            except (ValueError, AttributeError):
+                angle = 0
+
+            entries.append(TrialEntry(
+                path=path,
+                participant=participant,
+                condition=condition,
+                trial_number=trial_number,
+                session=session,
+                angle=angle,
+                status="unloaded"
+            ))
+
+        return entries
+
+
+class ExportCSVDialog(QtWidgets.QDialog):
+    """Dialog for configuring CSV export with annotation embedding."""
+
+    def __init__(
+        self,
+        annotations: List[AnnotationSegment],
+        parent: QtWidgets.QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export CSV with Annotations")
+        self.resize(700, 400)
+        self.annotations = annotations
+        self.manual_indices: Dict[int, int] = {}
+
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Checkbox to enable annotation embedding
+        self.embed_chk = QtWidgets.QCheckBox("Embed annotations as episode columns")
+        self.embed_chk.setChecked(True)
+        self.embed_chk.stateChanged.connect(self._on_embed_changed)
+        layout.addWidget(self.embed_chk)
+
+        # Info label
+        info = QtWidgets.QLabel(
+            "Annotations will be written as episode_index, episode_type, and episode_state columns."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Episode index mode
+        self.mode_group = QtWidgets.QGroupBox("Episode Index Assignment")
+        mode_layout = QtWidgets.QVBoxLayout(self.mode_group)
+
+        self.auto_radio = QtWidgets.QRadioButton("Auto-detect (assign sequential indices by start time)")
+        self.auto_radio.setChecked(True)
+        self.manual_radio = QtWidgets.QRadioButton("Manual configuration")
+        self.manual_radio.toggled.connect(self._on_mode_changed)
+
+        mode_layout.addWidget(self.auto_radio)
+        mode_layout.addWidget(self.manual_radio)
+        layout.addWidget(self.mode_group)
+
+        # Manual index table
+        self.table_group = QtWidgets.QGroupBox("Manual Episode Indices")
+        table_layout = QtWidgets.QVBoxLayout(self.table_group)
+
+        self.index_table = QtWidgets.QTableWidget(0, 5)
+        self.index_table.setHorizontalHeaderLabels([
+            "ID", "Start", "End", "Label", "Episode Index"
+        ])
+        self.index_table.horizontalHeader().setStretchLastSection(True)
+        self.index_table.horizontalHeader().setSectionResizeMode(
+            3, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        table_layout.addWidget(self.index_table)
+
+        # Populate table
+        self._populate_table()
+
+        self.table_group.setVisible(False)
+        layout.addWidget(self.table_group)
+
+        # Buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _populate_table(self) -> None:
+        """Populate table with annotations sorted by start time."""
+        sorted_anns = sorted(self.annotations, key=lambda a: a.start)
+        self.index_table.setRowCount(len(sorted_anns))
+
+        for row, ann in enumerate(sorted_anns):
+            # ID (read-only)
+            id_item = QtWidgets.QTableWidgetItem(str(ann.id))
+            id_item.setFlags(id_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.index_table.setItem(row, 0, id_item)
+
+            # Start (read-only)
+            start_item = QtWidgets.QTableWidgetItem(f"{ann.start:.3f}")
+            start_item.setFlags(start_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.index_table.setItem(row, 1, start_item)
+
+            # End (read-only)
+            end_item = QtWidgets.QTableWidgetItem(f"{ann.end:.3f}")
+            end_item.setFlags(end_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.index_table.setItem(row, 2, end_item)
+
+            # Label (read-only)
+            label_item = QtWidgets.QTableWidgetItem(ann.label)
+            label_item.setFlags(label_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.index_table.setItem(row, 3, label_item)
+
+            # Episode Index (editable spinbox)
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(1, 9999)
+            spin.setValue(row + 1)  # Default: sequential
+            spin.setProperty("ann_id", ann.id)
+            self.index_table.setCellWidget(row, 4, spin)
+
+    def _on_embed_changed(self, state: int) -> None:
+        """Toggle visibility of mode options."""
+        enabled = state == QtCore.Qt.CheckState.Checked.value
+        self.mode_group.setEnabled(enabled)
+        if not enabled:
+            self.table_group.setVisible(False)
+            self.resize(700, 400)
+
+    def _on_mode_changed(self, manual: bool) -> None:
+        """Show/hide manual index table."""
+        self.table_group.setVisible(manual)
+        if manual:
+            self.resize(700, 600)
+        else:
+            self.resize(700, 400)
+
+    def _validate_and_accept(self) -> None:
+        """Validate indices and check for conflicts before accepting."""
+        if self.embed_chk.isChecked() and self.manual_radio.isChecked():
+            self.manual_indices = {}
+            used_indices: set = set()
+
+            for row in range(self.index_table.rowCount()):
+                spin = self.index_table.cellWidget(row, 4)
+                ann_id = spin.property("ann_id")
+                idx = spin.value()
+
+                if idx in used_indices:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Duplicate Index",
+                        f"Episode index {idx} is used multiple times. Each annotation must have a unique index."
+                    )
+                    return
+
+                self.manual_indices[ann_id] = idx
+                used_indices.add(idx)
+
+        self.accept()
+
+    def export_params(self) -> Dict:
+        """Return export parameters."""
+        return {
+            "embed_annotations": self.embed_chk.isChecked(),
+            "manual_indices": self.manual_indices if self.manual_radio.isChecked() else None,
+        }
+

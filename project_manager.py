@@ -3,8 +3,62 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
+
+
+@dataclass
+class ParsedFilename:
+    """Result of parsing a trial filename."""
+    trial_number: int
+    session: int
+    participant: str
+    condition: str
+    angle: int
+    parse_success: bool
+    original_filename: str
+
+
+def parse_trial_filename(filepath: str) -> ParsedFilename:
+    """
+    Parse trial metadata from filename pattern: trial_session_participant_condition_angle.csv
+
+    Example: 8_1_P13_Stand_45.csv -> (8, 1, "P13", "Stand", 45)
+
+    Args:
+        filepath: Full path to CSV file
+
+    Returns:
+        ParsedFilename with extracted fields and parse_success flag
+    """
+    filename = os.path.basename(filepath)
+    name_without_ext = os.path.splitext(filename)[0]
+
+    # Pattern: trial_session_participant_condition_angle
+    pattern = r'^(\d+)_(\d+)_(P\d+)_(Sit|Stand|Swivel)_(\d+)$'
+    match = re.match(pattern, name_without_ext, re.IGNORECASE)
+
+    if match:
+        return ParsedFilename(
+            trial_number=int(match.group(1)),
+            session=int(match.group(2)),
+            participant=match.group(3).upper(),
+            condition=match.group(4).capitalize(),
+            angle=int(match.group(5)),
+            parse_success=True,
+            original_filename=filename
+        )
+    else:
+        return ParsedFilename(
+            trial_number=0,
+            session=0,
+            participant="",
+            condition="",
+            angle=0,
+            parse_success=False,
+            original_filename=filename
+        )
 
 
 @dataclass
@@ -15,6 +69,10 @@ class TrialEntry:
     status: str = "unloaded"  # unloaded / loaded / cleaned / exported
     summary: str = ""
     notes: str = ""
+    # Additional parsed metadata fields
+    trial_number: int = 0
+    session: int = 0
+    angle: int = 0
 
 
 @dataclass
@@ -41,6 +99,10 @@ class ProjectManager:
 
     def add_trial(self, path: str, participant: str = "", condition: str = "") -> None:
         self.trials.append(TrialEntry(path=path, participant=participant, condition=condition))
+
+    def add_trials_bulk(self, entries: List[TrialEntry]) -> None:
+        """Add multiple trials at once."""
+        self.trials.extend(entries)
 
     def update_status(self, path: str, status: str, summary: str = "") -> None:
         for t in self.trials:

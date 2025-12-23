@@ -3,3 +3,4 @@ pandas
 PyQt6
 pyqtgraph
 scipy
+PyOpenGL
