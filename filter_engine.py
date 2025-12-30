@@ -85,6 +85,14 @@ class FilterEngine:
             elif filter_type == "interpolate":
                 method = params.get("method", "linear")
                 filtered = series.interpolate(method=method, limit_direction="both")
+            elif filter_type == "invert_polarity":
+                filtered = -series
+            elif filter_type == "invert_mean":
+                mean_val = series.mean()
+                filtered = 2 * mean_val - series
+            elif filter_type == "invert_reference":
+                ref = float(params.get("reference", 0.0))
+                filtered = 2 * ref - series
             else:
                 filtered = series
             out.loc[mask, ch] = filtered
@@ -186,5 +194,8 @@ def available_filters() -> List[str]:
         "normalize_percent",
         "moving_rms",
         "absolute",
+        "invert_polarity",
+        "invert_mean",
+        "invert_reference",
     ]
 

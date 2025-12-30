@@ -206,7 +206,7 @@ class DataModel(QtCore.QObject):
         self.historyChanged.emit()
         self.statusMessage.emit(f"Marked bad {start:.3f}-{end:.3f} s")
 
-    def annotate(self, start: float, end: float, label: str, track: str = "default", color: str = "#4e79a7") -> None:
+    def annotate(self, start: float, end: float, label: str, track: str = "episode", color: str = "#4e79a7") -> None:
         if self.df is None or start >= end:
             self.statusMessage.emit("Invalid annotation range")
             return

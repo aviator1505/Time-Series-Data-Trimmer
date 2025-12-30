@@ -216,8 +216,8 @@ class ProjectPanel(QtWidgets.QWidget):
         btns.addWidget(self.add_folder_btn)
         btns.addWidget(self.save_btn)
         layout.addLayout(btns)
-        self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels([ "Participant", "Condition", "Angle", "Status", "Summary", "Path"])
+        self.table = QtWidgets.QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["Path", "Participant", "Condition", "Trial", "Session", "Angle", "Status", "Summary"])
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
         self.add_btn.clicked.connect(self.add_trial)
@@ -232,9 +232,11 @@ class ProjectPanel(QtWidgets.QWidget):
             self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(t.path))
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(t.participant))
             self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(t.condition))
-            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(t.angle) if t.angle else ""))
-            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(t.status))
-            self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(t.summary))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(t.trial_number) if t.trial_number else ""))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(t.session) if t.session else ""))
+            self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(t.angle) if t.angle else ""))
+            self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(t.status))
+            self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(t.summary))
 
     def add_trial(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add trial CSV", "", "CSV files (*.csv)")
@@ -332,6 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frames: Dict[str, Dict] = {"lab": {"parent": "", "offset": 0.0}}
         self.mapping: Dict[str, Dict[str, str]] = {}
         self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
+        self.loaded_file_path: str | None = None
         self.plot2d = PlotController2D()
         self.plot3d = PlotController3D()
         self.style_panel = ChannelStylePanel(
@@ -560,15 +563,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_model.dataChanged.connect(self._on_data_changed)
         self.data_model.annotationsChanged.connect(self._on_annotations_changed)
         self.data_model.historyChanged.connect(self._on_history_changed)
-        self.data_model.statusMessage.connect(self.statusBar().showMessage)
+        self.data_model.statusMessage.connect(self.statusBar().showMessage)     
         self.plot2d.widget.scene().sigMouseClicked.connect(self.on_plot_clicked)
         self.plot2d.set_selection_callback(self.on_region_dragged)
-        self.plot2d.set_annotation_drag_callback(self.on_annotation_dragged)
+        self.plot2d.set_annotation_drag_callback(self.on_annotation_dragged)   
         self.filter_panel.applyRequested.connect(lambda: self.apply_filters_from_panel(preview=False))
         self.filter_panel.previewRequested.connect(lambda: self.apply_filters_from_panel(preview=True))
-        self.style_panel.styleChanged.connect(self.on_channel_style_changed)
+       
+        self.style_panel.styleChanged.connect(self.on_channel_style_changed)       
         self.ann_table.itemSelectionChanged.connect(self.on_annotation_selected)
-        self.ann_table.itemDoubleClicked.connect(self.on_annotation_edit)
+        self.ann_table.itemDoubleClicked.connect(self.on_annotation_edit) 
         self.suggestions.itemDoubleClicked.connect(self.on_accept_suggestion)
         self.play_action.triggered.connect(self.toggle_playback)
         self.stop_action.triggered.connect(self.stop_playback)
@@ -593,6 +597,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self)
         self.play_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
         self.play_shortcut.activated.connect(self.toggle_playback)
+        # Edit mode shortcut
+        self.edit_mode_shortcut = QtGui.QShortcut(QtGui.QKeySequence("E"), self)
+        self.edit_mode_shortcut.activated.connect(lambda: self.edit_mode_btn.setChecked(True))
 
     def on_open_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV files (*.csv)")
@@ -606,6 +613,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def load_file(self, path: str) -> None:
         self.data_model.load_csv(path)
+        self.loaded_file_path = path
         self.filter_engine.set_sample_rate(self.data_model.sample_rate)
         groups = self.data_model.channel_groups()
         self.channel_manager.populate(self.data_model.time_columns, self.data_model.metadata_columns, groups)
@@ -617,6 +625,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_suggestions()
 
     def on_save_clean(self) -> None:
+        from project_manager import parse_trial_filename
+
         # Show export options dialog if annotations exist
         embed_annotations = True
         manual_indices = None
@@ -629,8 +639,30 @@ class MainWindow(QtWidgets.QMainWindow):
             embed_annotations = params["embed_annotations"]
             manual_indices = params["manual_indices"]
 
-        # Get save path
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save cleaned CSV", "", "CSV files (*.csv)")
+        # Determine default save directory and filename
+        base_dir = "/Users/avimehrotra/development/TDATA/MetricsData_Hybrid/EditedTrials"
+        default_path = base_dir
+
+        if self.loaded_file_path:
+            parsed = parse_trial_filename(self.loaded_file_path)
+            filename = os.path.basename(self.loaded_file_path)
+
+            if parsed.parse_success and parsed.participant:
+                # Create participant subfolder
+                participant_dir = os.path.join(base_dir, parsed.participant)
+                os.makedirs(participant_dir, exist_ok=True)
+                default_path = os.path.join(participant_dir, filename)
+            else:
+                # Fallback: use base directory with original filename
+                os.makedirs(base_dir, exist_ok=True)
+                default_path = os.path.join(base_dir, filename)
+        else:
+            os.makedirs(base_dir, exist_ok=True)
+
+        # Get save path with pre-populated default
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save cleaned CSV", default_path, "CSV files (*.csv)"
+        )
         if not path:
             return
         if not path.lower().endswith(".csv"):

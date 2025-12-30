@@ -27,6 +27,9 @@ FILTER_PARAM_MAP: Dict[str, List[str]] = {
     "normalize_percent": [],
     "moving_rms": ["window"],
     "absolute": [],
+    "invert_polarity": [],
+    "invert_mean": [],
+    "invert_reference": ["reference"],
 }
 
 FILTER_DESCRIPTIONS: Dict[str, str] = {
@@ -44,6 +47,9 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
     "normalize_percent": "Scale to +/-100 based on the maximum absolute value.",
     "moving_rms": "Rolling RMS envelope; window controls smoothing in samples.",
     "absolute": "Absolute value of the signal.",
+    "invert_polarity": "Negate all values in the signal (-x).",
+    "invert_mean": "Flip values around the channel mean (2*mean - x).",
+    "invert_reference": "Flip values around a specified reference point (2*ref - x).",
 }
 
 INTERPOLATE_METHODS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
@@ -112,6 +118,11 @@ class FilterDialog(QtWidgets.QDialog):
         self.method_combo = QtWidgets.QComboBox()
         self.method_combo.addItems(INTERPOLATE_METHODS)
         self._add_param_row(form, "Interpolation", self.method_combo, "method")
+        self.reference_spin = QtWidgets.QDoubleSpinBox()
+        self.reference_spin.setRange(-1e9, 1e9)
+        self.reference_spin.setDecimals(4)
+        self.reference_spin.setValue(0.0)
+        self._add_param_row(form, "Reference value", self.reference_spin, "reference")
         layout.addLayout(form)
         self.filter_help = QtWidgets.QLabel()
         self.filter_help.setWordWrap(True)
@@ -182,6 +193,8 @@ class FilterDialog(QtWidgets.QDialog):
             return self.target_fs_spin.value()
         if key == "method":
             return self.method_combo.currentText()
+        if key == "reference":
+            return self.reference_spin.value()
         return None
 
     def _apply_preset(self) -> None:
@@ -267,6 +280,11 @@ class FilterPanel(QtWidgets.QWidget):
         self.method_combo = QtWidgets.QComboBox()
         self.method_combo.addItems(INTERPOLATE_METHODS)
         self._add_param_row(form, "Interpolation", self.method_combo, "method")
+        self.reference_spin = QtWidgets.QDoubleSpinBox()
+        self.reference_spin.setRange(-1e9, 1e9)
+        self.reference_spin.setDecimals(4)
+        self.reference_spin.setValue(0.0)
+        self._add_param_row(form, "Reference value", self.reference_spin, "reference")
         layout.addLayout(form)
         self.filter_help = QtWidgets.QLabel()
         self.filter_help.setWordWrap(True)
@@ -372,6 +390,8 @@ class FilterPanel(QtWidgets.QWidget):
             return self.target_fs_spin.value()
         if key == "method":
             return self.method_combo.currentText()
+        if key == "reference":
+            return self.reference_spin.value()
         return None
 
 

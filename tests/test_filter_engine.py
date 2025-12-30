@@ -24,6 +24,9 @@ def test_available_filters_includes_new_entries():
     filters = available_filters()
     assert "moving_rms" in filters
     assert "absolute" in filters
+    assert "invert_polarity" in filters
+    assert "invert_mean" in filters
+    assert "invert_reference" in filters
 
 
 def test_moving_rms_matches_manual():
@@ -48,3 +51,29 @@ def test_absolute_filter_handles_negative_values():
     assert np.array_equal(
         out["ch"].to_numpy(), np.array([2, 1, 0, 1, 2], dtype=float)
     )
+
+
+def test_invert_polarity_negates_values():
+    df = _make_df([-3, -1, 0, 2, 5])
+    engine = FilterEngine()
+    out = engine.apply(df, ["ch"], "invert_polarity", {})
+    expected = np.array([3, 1, 0, -2, -5], dtype=float)
+    assert np.array_equal(out["ch"].to_numpy(), expected)
+
+
+def test_invert_mean_flips_around_mean():
+    df = _make_df([1, 2, 3, 4, 5])  # mean = 3
+    engine = FilterEngine()
+    out = engine.apply(df, ["ch"], "invert_mean", {})
+    # 2*3 - [1,2,3,4,5] = [5,4,3,2,1]
+    expected = np.array([5, 4, 3, 2, 1], dtype=float)
+    assert np.allclose(out["ch"].to_numpy(), expected)
+
+
+def test_invert_reference_flips_around_reference():
+    df = _make_df([0, 5, 10, 15, 20])
+    engine = FilterEngine()
+    out = engine.apply(df, ["ch"], "invert_reference", {"reference": 10})
+    # 2*10 - [0,5,10,15,20] = [20,15,10,5,0]
+    expected = np.array([20, 15, 10, 5, 0], dtype=float)
+    assert np.array_equal(out["ch"].to_numpy(), expected)
