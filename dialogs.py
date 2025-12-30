@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 from data_model import AnnotationSegment
 from filter_engine import available_filters
@@ -55,6 +56,20 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
 }
 
 INTERPOLATE_METHODS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
+
+
+class NumericTableItem(QtWidgets.QTableWidgetItem):
+    """Custom QTableWidgetItem that sorts numerically instead of alphabetically.
+
+    This ensures columns containing formatted numbers (e.g., "10.500") sort
+    correctly so that 2.000 < 10.500, rather than "10.500" < "2.000" alphabetically.
+    """
+
+    def __lt__(self, other: QtWidgets.QTableWidgetItem) -> bool:
+        try:
+            return float(self.text()) < float(other.text())
+        except ValueError:
+            return super().__lt__(other)
 
 
 class FilterDialog(QtWidgets.QDialog):
@@ -156,10 +171,49 @@ class FilterDialog(QtWidgets.QDialog):
                 chans.append(item.text())
         return chans
 
-    def parameters(self) -> Dict:
+    def validate_parameters(self) -> List[str]:
+        """Validate current filter parameters without modifying UI state.
+
+        Returns:
+            List of validation error messages. Empty list if all parameters are valid.
+        """
+        errors: List[str] = []
         filter_type = self.filter_combo.currentText()
 
-        # Validate filter-specific parameters BEFORE returning
+        if filter_type == "savgol":
+            window = self.window_spin.value()
+            polyorder = self.poly_spin.value()
+            if polyorder >= window:
+                errors.append(
+                    f"Polynomial order ({polyorder}) must be less than window size ({window}). "
+                    f"Either increase window or decrease polynomial order."
+                )
+        elif filter_type == "butter_bandpass":
+            low = self.cutoff_spin.value()
+            high = self.high_cutoff_spin.value()
+            if low >= high:
+                errors.append(
+                    f"Low cutoff ({low} Hz) must be less than high cutoff ({high} Hz)."
+                )
+
+        return errors
+
+    def parameters(self) -> Dict:
+        """Get current filter parameters as a dictionary.
+
+        This is a pure getter that does not modify UI state. Window values for
+        Savgol filter are adjusted locally (odd requirement) without changing
+        the spinbox. Call validate_parameters() first to check for errors.
+
+        Returns:
+            Dictionary of filter parameters
+
+        Raises:
+            ValueError: If parameters are invalid (polyorder >= window, low >= high cutoff)
+        """
+        filter_type = self.filter_combo.currentText()
+
+        # Validate parameters - raise errors for invalid combinations
         if filter_type == "savgol":
             window = self.window_spin.value()
             polyorder = self.poly_spin.value()
@@ -168,13 +222,8 @@ class FilterDialog(QtWidgets.QDialog):
                     f"Polynomial order ({polyorder}) must be less than window size ({window}).\n"
                     f"Either increase window or decrease polynomial order."
                 )
-            if window % 2 == 0:
-                # Auto-correct even window to odd
-                window += 1
-                self.window_spin.setValue(window)
-
         elif filter_type == "butter_bandpass":
-            low = self.cutoff_spin.value()  # This maps to "low_cut" for bandpass
+            low = self.cutoff_spin.value()
             high = self.high_cutoff_spin.value()
             if low >= high:
                 raise ValueError(
@@ -189,6 +238,14 @@ class FilterDialog(QtWidgets.QDialog):
         }
         for key in FILTER_PARAM_MAP.get(filter_type, []):
             params[key] = self._param_value(key)
+
+        # Apply window adjustment locally for savgol (odd window required)
+        # This does NOT modify the UI spinbox - the adjustment is only in the returned params
+        if filter_type == "savgol" and "window" in params:
+            window_val = params["window"]
+            if isinstance(window_val, int) and window_val % 2 == 0:
+                params["window"] = window_val + 1
+
         return params
 
     def _preview(self) -> None:
@@ -346,6 +403,14 @@ class FilterPanel(QtWidgets.QWidget):
         self.unselect_all_btn.clicked.connect(self.unselect_all_channels)
         self._on_filter_changed(self.filter_combo.currentText())
 
+        # Keyboard shortcuts for improved accessibility
+        # Ctrl+Return to apply filter
+        apply_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        apply_shortcut.activated.connect(self.applyRequested.emit)
+        # Ctrl+P to preview filter
+        preview_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
+        preview_shortcut.activated.connect(self.previewRequested.emit)
+
     def set_channels(self, channels: List[str]) -> None:
         self.list_widget.clear()
         for ch in channels:
@@ -373,10 +438,52 @@ class FilterPanel(QtWidgets.QWidget):
             if item:
                 item.setCheckState(QtCore.Qt.CheckState.Unchecked)
 
-    def parameters(self, preview: bool = False) -> Dict:
+    def validate_parameters(self) -> List[str]:
+        """Validate current filter parameters without modifying UI state.
+
+        Returns:
+            List of validation error messages. Empty list if all parameters are valid.
+        """
+        errors: List[str] = []
         filter_type = self.filter_combo.currentText()
 
-        # Validate filter-specific parameters BEFORE returning
+        if filter_type == "savgol":
+            window = self.window_spin.value()
+            polyorder = self.poly_spin.value()
+            if polyorder >= window:
+                errors.append(
+                    f"Polynomial order ({polyorder}) must be less than window size ({window}). "
+                    f"Either increase window or decrease polynomial order."
+                )
+        elif filter_type == "butter_bandpass":
+            low = self.cutoff_spin.value()
+            high = self.high_cutoff_spin.value()
+            if low >= high:
+                errors.append(
+                    f"Low cutoff ({low} Hz) must be less than high cutoff ({high} Hz)."
+                )
+
+        return errors
+
+    def parameters(self, preview: bool = False) -> Dict:
+        """Get current filter parameters as a dictionary.
+
+        This is a pure getter that does not modify UI state. Window values for
+        Savgol filter are adjusted locally (odd requirement) without changing
+        the spinbox. Call validate_parameters() first to check for errors.
+
+        Args:
+            preview: Whether this is a preview request
+
+        Returns:
+            Dictionary of filter parameters
+
+        Raises:
+            ValueError: If parameters are invalid (polyorder >= window, low >= high cutoff)
+        """
+        filter_type = self.filter_combo.currentText()
+
+        # Validate parameters - raise errors for invalid combinations
         if filter_type == "savgol":
             window = self.window_spin.value()
             polyorder = self.poly_spin.value()
@@ -385,13 +492,8 @@ class FilterPanel(QtWidgets.QWidget):
                     f"Polynomial order ({polyorder}) must be less than window size ({window}).\n"
                     f"Either increase window or decrease polynomial order."
                 )
-            if window % 2 == 0:
-                # Auto-correct even window to odd
-                window += 1
-                self.window_spin.setValue(window)
-
         elif filter_type == "butter_bandpass":
-            low = self.cutoff_spin.value()  # This maps to "low_cut" for bandpass
+            low = self.cutoff_spin.value()
             high = self.high_cutoff_spin.value()
             if low >= high:
                 raise ValueError(
@@ -406,6 +508,14 @@ class FilterPanel(QtWidgets.QWidget):
         }
         for key in FILTER_PARAM_MAP.get(filter_type, []):
             params[key] = self._param_value(key)
+
+        # Apply window adjustment locally for savgol (odd window required)
+        # This does NOT modify the UI spinbox - the adjustment is only in the returned params
+        if filter_type == "savgol" and "window" in params:
+            window_val = params["window"]
+            if isinstance(window_val, int) and window_val % 2 == 0:
+                params["window"] = window_val + 1
+
         return params
 
     def _apply_preset(self) -> None:
@@ -469,22 +579,28 @@ class AnnotationTable(QtWidgets.QTableWidget):
         self.horizontalHeader().setStretchLastSection(True)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Enable sorting by clicking column headers
+        self.setSortingEnabled(True)
 
     def populate(self, annotations: List[AnnotationSegment]) -> None:
+        # Temporarily disable sorting during population to avoid performance issues
+        # and to prevent sorting from interfering with row insertion
+        self.setSortingEnabled(False)
         self.setRowCount(len(annotations))
         for row, ann in enumerate(annotations):
             duration = ann.end - ann.start
-            entries = [
-                str(ann.id),
-                f"{ann.start:.3f}",
-                f"{ann.end:.3f}",
-                f"{duration:.3f}",
-                ann.label,
-                ann.track,
-                ann.color,
-            ]
-            for col, val in enumerate(entries):
-                self.setItem(row, col, QtWidgets.QTableWidgetItem(val))
+            # Column 0: ID (use NumericTableItem for numeric sorting)
+            self.setItem(row, 0, NumericTableItem(str(ann.id)))
+            # Columns 1-3: Start, End, Duration (use NumericTableItem for numeric sorting)
+            self.setItem(row, 1, NumericTableItem(f"{ann.start:.3f}"))
+            self.setItem(row, 2, NumericTableItem(f"{ann.end:.3f}"))
+            self.setItem(row, 3, NumericTableItem(f"{duration:.3f}"))
+            # Columns 4-6: Label, Track, Color (standard string items)
+            self.setItem(row, 4, QtWidgets.QTableWidgetItem(ann.label))
+            self.setItem(row, 5, QtWidgets.QTableWidgetItem(ann.track))
+            self.setItem(row, 6, QtWidgets.QTableWidgetItem(ann.color))
+        # Re-enable sorting after population
+        self.setSortingEnabled(True)
 
     def selected_annotation_id(self) -> int:
         row = self.currentRow()
@@ -600,95 +716,786 @@ class ShortcutDialog(QtWidgets.QDialog):
 
 
 class FrameManagerDialog(QtWidgets.QDialog):
+    """Dialog for managing coordinate frame hierarchy.
+
+    This dialog allows users to define coordinate frames with parent-child
+    relationships for proper kinematic chain computation. Each frame has:
+    - A unique name
+    - An optional parent frame (for hierarchical transforms)
+    - A local offset (heading offset relative to parent)
+    - A computed total offset (accumulated from all ancestors)
+
+    The hierarchy is essential for multi-sensor setups where:
+    - IMU on head is relative to IMU on torso
+    - Gaze direction is relative to head orientation
+    - Chair reference frame is the "world" frame with offset 0
+    """
+
     def __init__(self, frames: Dict[str, Dict], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Coordinate Frames")
+        self.resize(600, 400)
         self.frames = frames
         layout = QtWidgets.QVBoxLayout(self)
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Frame", "Parent", "Offset (deg)"])
+
+        # Info label explaining hierarchy
+        info_label = QtWidgets.QLabel(
+            "Define coordinate frames with parent relationships. "
+            "Total offset is computed by walking the parent chain."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Table with 4 columns: Frame, Parent, Local Offset, Total Offset
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Frame", "Parent", "Local Offset (deg)", "Total Offset (deg)"])
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         layout.addWidget(self.table)
-        self._populate()
-        btn_add = QtWidgets.QPushButton("Add frame")
+
+        # Warning label for cycles (hidden by default)
+        self.cycle_warning = QtWidgets.QLabel()
+        self.cycle_warning.setStyleSheet("color: red; font-weight: bold;")
+        self.cycle_warning.setVisible(False)
+        layout.addWidget(self.cycle_warning)
+
+        # Buttons
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_add = QtWidgets.QPushButton("Add Frame")
         btn_add.clicked.connect(self._add_frame)
-        layout.addWidget(btn_add)
+        btn_edit = QtWidgets.QPushButton("Edit Frame")
+        btn_edit.clicked.connect(self._edit_frame)
+        btn_remove = QtWidgets.QPushButton("Remove Frame")
+        btn_remove.clicked.connect(self._remove_frame)
+        btn_layout.addWidget(btn_add)
+        btn_layout.addWidget(btn_edit)
+        btn_layout.addWidget(btn_remove)
+        layout.addLayout(btn_layout)
+
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
+        self._populate()
+
+    def _compute_total_offset(self, frame_name: str, visited: set | None = None) -> float:
+        """Compute total heading offset by walking parent chain.
+
+        Implements proper kinematic chain: child offset is relative to parent.
+        Includes cycle detection to prevent infinite loops.
+
+        Args:
+            frame_name: The frame to compute offset for.
+            visited: Set of already-visited frame names (for recursion).
+
+        Returns:
+            Total accumulated offset in degrees.
+        """
+        if visited is None:
+            visited = set()
+        if frame_name in visited:
+            return 0.0  # Cycle detected, break recursion
+        visited.add(frame_name)
+
+        info = self.frames.get(frame_name, {})
+        offset = float(info.get("offset", 0.0))
+        parent = info.get("parent", "")
+
+        if parent and parent in self.frames:
+            # Recursively add parent's total offset
+            offset += self._compute_total_offset(parent, visited)
+
+        return offset
+
+    def _detect_cycle(self, frame_name: str) -> bool:
+        """Check if a frame is part of a cycle in the parent chain.
+
+        Args:
+            frame_name: The frame to check.
+
+        Returns:
+            True if a cycle is detected.
+        """
+        visited = set()
+        current = frame_name
+        while current:
+            if current in visited:
+                return True
+            visited.add(current)
+            info = self.frames.get(current, {})
+            current = info.get("parent", "")
+        return False
+
+    def _get_frame_chain(self, frame_name: str) -> List[str]:
+        """Get the chain of frames from root to the given frame.
+
+        Args:
+            frame_name: The frame to trace.
+
+        Returns:
+            List of frame names from root to frame_name.
+        """
+        chain = []
+        current = frame_name
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            if current in self.frames:
+                chain.append(current)
+                current = self.frames[current].get("parent", "")
+            else:
+                break
+        return list(reversed(chain))
+
     def _populate(self) -> None:
+        """Populate the table with frame data including computed total offsets."""
         self.table.setRowCount(0)
-        for name, info in self.frames.items():
+        cycles_detected = []
+
+        # Sort frames to show hierarchy (root frames first, then children)
+        sorted_frames = self._sort_frames_by_hierarchy()
+
+        for name in sorted_frames:
+            info = self.frames[name]
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
-            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(info.get("parent", "")))
-            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(info.get("offset", 0.0))))
+
+            # Check for cycles
+            has_cycle = self._detect_cycle(name)
+            if has_cycle:
+                cycles_detected.append(name)
+
+            # Column 0: Frame name with indentation for hierarchy visualization
+            chain = self._get_frame_chain(name)
+            indent = "  " * (len(chain) - 1) if chain else ""
+            name_item = QtWidgets.QTableWidgetItem(f"{indent}{name}")
+            name_item.setData(QtCore.Qt.ItemDataRole.UserRole, name)  # Store actual name
+            if has_cycle:
+                name_item.setBackground(QtGui.QColor(255, 200, 200))
+            self.table.setItem(row, 0, name_item)
+
+            # Column 1: Parent
+            parent_text = info.get("parent", "")
+            parent_item = QtWidgets.QTableWidgetItem(parent_text if parent_text else "(root)")
+            if has_cycle:
+                parent_item.setBackground(QtGui.QColor(255, 200, 200))
+            self.table.setItem(row, 1, parent_item)
+
+            # Column 2: Local Offset
+            local_offset = float(info.get("offset", 0.0))
+            local_item = NumericTableItem(f"{local_offset:.2f}")
+            if has_cycle:
+                local_item.setBackground(QtGui.QColor(255, 200, 200))
+            self.table.setItem(row, 2, local_item)
+
+            # Column 3: Total Offset (computed)
+            if has_cycle:
+                total_item = QtWidgets.QTableWidgetItem("CYCLE")
+                total_item.setBackground(QtGui.QColor(255, 200, 200))
+                total_item.setForeground(QtGui.QColor(180, 0, 0))
+            else:
+                total_offset = self._compute_total_offset(name)
+                total_item = NumericTableItem(f"{total_offset:.2f}")
+            self.table.setItem(row, 3, total_item)
+
+        # Show/hide cycle warning
+        if cycles_detected:
+            self.cycle_warning.setText(
+                f"Warning: Cycle detected in frames: {', '.join(cycles_detected)}. "
+                "Edit parent relationships to break the cycle."
+            )
+            self.cycle_warning.setVisible(True)
+        else:
+            self.cycle_warning.setVisible(False)
+
+    def _sort_frames_by_hierarchy(self) -> List[str]:
+        """Sort frames so parents appear before children.
+
+        Returns:
+            List of frame names sorted by hierarchy depth.
+        """
+        # Calculate depth for each frame
+        depths: Dict[str, int] = {}
+        for name in self.frames:
+            depth = 0
+            current = name
+            visited = set()
+            while current and current not in visited:
+                visited.add(current)
+                info = self.frames.get(current, {})
+                parent = info.get("parent", "")
+                if parent and parent in self.frames:
+                    depth += 1
+                    current = parent
+                else:
+                    break
+            depths[name] = depth
+
+        # Sort by depth, then alphabetically
+        return sorted(self.frames.keys(), key=lambda x: (depths.get(x, 0), x))
 
     def _add_frame(self) -> None:
-        name, ok = QtWidgets.QInputDialog.getText(self, "Frame name", "Name")
-        if not ok or not name:
+        """Add a new frame with parent selection dialog."""
+        dialog = _FrameEditDialog(
+            existing_frames=list(self.frames.keys()),
+            parent=self
+        )
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            data = dialog.get_data()
+            name = data["name"]
+            if name in self.frames:
+                QtWidgets.QMessageBox.warning(
+                    self, "Duplicate Name",
+                    f"A frame named '{name}' already exists."
+                )
+                return
+            self.frames[name] = {"parent": data["parent"], "offset": data["offset"]}
+            self._populate()
+
+    def _edit_frame(self) -> None:
+        """Edit the selected frame."""
+        row = self.table.currentRow()
+        if row < 0:
+            QtWidgets.QMessageBox.information(self, "No Selection", "Please select a frame to edit.")
             return
-        parent, _ = QtWidgets.QInputDialog.getText(self, "Parent frame", "Parent (optional)")
-        offset, _ = QtWidgets.QInputDialog.getDouble(self, "Heading offset", "Offset degrees", decimals=2)
-        self.frames[name] = {"parent": parent, "offset": offset}
+
+        name_item = self.table.item(row, 0)
+        name = name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not name or name not in self.frames:
+            return
+
+        info = self.frames[name]
+        # Exclude this frame from parent options to prevent self-reference
+        other_frames = [f for f in self.frames.keys() if f != name]
+
+        dialog = _FrameEditDialog(
+            existing_frames=other_frames,
+            current_name=name,
+            current_parent=info.get("parent", ""),
+            current_offset=float(info.get("offset", 0.0)),
+            parent=self
+        )
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            data = dialog.get_data()
+            new_name = data["name"]
+
+            # Handle rename
+            if new_name != name:
+                if new_name in self.frames:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Duplicate Name",
+                        f"A frame named '{new_name}' already exists."
+                    )
+                    return
+                # Update any frames that reference the old name as parent
+                for other_name, other_info in self.frames.items():
+                    if other_info.get("parent") == name:
+                        other_info["parent"] = new_name
+                del self.frames[name]
+                name = new_name
+
+            self.frames[name] = {"parent": data["parent"], "offset": data["offset"]}
+
+            # Check for cycles after edit
+            if self._detect_cycle(name):
+                QtWidgets.QMessageBox.warning(
+                    self, "Cycle Detected",
+                    f"Setting '{data['parent']}' as parent of '{name}' creates a cycle. "
+                    "The frame will be saved but marked as invalid."
+                )
+
+            self._populate()
+
+    def _remove_frame(self) -> None:
+        """Remove the selected frame."""
+        row = self.table.currentRow()
+        if row < 0:
+            QtWidgets.QMessageBox.information(self, "No Selection", "Please select a frame to remove.")
+            return
+
+        name_item = self.table.item(row, 0)
+        name = name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not name or name not in self.frames:
+            return
+
+        # Check if other frames reference this as parent
+        children = [f for f, info in self.frames.items() if info.get("parent") == name]
+        if children:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Confirm Removal",
+                f"Frame '{name}' is the parent of: {', '.join(children)}.\n"
+                "Removing it will clear their parent references.\n\nContinue?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            # Clear parent references
+            for child in children:
+                self.frames[child]["parent"] = ""
+
+        del self.frames[name]
         self._populate()
 
     def frames_data(self) -> Dict[str, Dict]:
+        """Return the frames dictionary."""
         return self.frames
 
 
+class _FrameEditDialog(QtWidgets.QDialog):
+    """Sub-dialog for adding/editing a single frame with parent dropdown."""
+
+    def __init__(
+        self,
+        existing_frames: List[str],
+        current_name: str = "",
+        current_parent: str = "",
+        current_offset: float = 0.0,
+        parent: QtWidgets.QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Frame" if current_name else "Add Frame")
+        self.resize(350, 200)
+
+        layout = QtWidgets.QFormLayout(self)
+
+        # Frame name
+        self.name_edit = QtWidgets.QLineEdit(current_name)
+        self.name_edit.setPlaceholderText("e.g., head, torso, chair")
+        layout.addRow("Frame Name:", self.name_edit)
+
+        # Parent dropdown with validation
+        self.parent_combo = QtWidgets.QComboBox()
+        self.parent_combo.addItem("(none - root frame)", "")
+        for frame in sorted(existing_frames):
+            self.parent_combo.addItem(frame, frame)
+        # Set current parent
+        if current_parent:
+            idx = self.parent_combo.findData(current_parent)
+            if idx >= 0:
+                self.parent_combo.setCurrentIndex(idx)
+        layout.addRow("Parent Frame:", self.parent_combo)
+
+        # Local offset
+        self.offset_spin = QtWidgets.QDoubleSpinBox()
+        self.offset_spin.setRange(-360.0, 360.0)
+        self.offset_spin.setDecimals(2)
+        self.offset_spin.setValue(current_offset)
+        self.offset_spin.setSuffix(" deg")
+        layout.addRow("Local Offset:", self.offset_spin)
+
+        # Help text
+        help_label = QtWidgets.QLabel(
+            "Local offset is the heading adjustment relative to the parent frame. "
+            "For root frames, this is relative to the lab/world frame."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow(help_label)
+
+        # Buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+
+    def _validate_and_accept(self) -> None:
+        """Validate input before accepting."""
+        name = self.name_edit.text().strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Invalid Name", "Frame name cannot be empty.")
+            return
+        self.accept()
+
+    def get_data(self) -> Dict:
+        """Return the frame data."""
+        return {
+            "name": self.name_edit.text().strip(),
+            "parent": self.parent_combo.currentData(),
+            "offset": self.offset_spin.value()
+        }
+
+
 class MappingDialog(QtWidgets.QDialog):
+    """Dialog for configuring 3D body part column mappings with validated dropdowns.
+
+    Replaces error-prone text entry with searchable combo boxes that only allow
+    selection from actual DataFrame columns. Position fields use separate x/y/z
+    dropdowns to prevent invalid entries.
+    """
+
+    # Style for invalid/warning state
+    INVALID_STYLE = "QComboBox { border: 2px solid #cc0000; background-color: #ffeeee; }"
+    VALID_STYLE = ""
+
     def __init__(self, columns: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("3D Mapping")
-        layout = QtWidgets.QGridLayout(self)
-        headers = ["Part", "Position (x,y,z)", "Orientation quat (qx,qy,qz,qw)", "Direction vec (dx,dy,dz, optional)"]
+        self.columns = sorted(columns)
+        self._setup_ui()
+        self._auto_detect_mappings()
+
+    def _setup_ui(self) -> None:
+        """Build the dialog UI with column combo boxes."""
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Instructions
+        instructions = QtWidgets.QLabel(
+            "Map body parts to DataFrame columns. Type to filter columns. "
+            "Leave empty for unmapped parts."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # Scrollable content area for the mapping grid
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(content)
+        grid.setSpacing(8)
+
+        # Headers
+        headers = ["Part", "X", "Y", "Z", "Quat X", "Quat Y", "Quat Z", "Quat W", "Dir X", "Dir Y", "Dir Z"]
         for col, hdr in enumerate(headers):
-            layout.addWidget(QtWidgets.QLabel(f"<b>{hdr}</b>"), 0, col)
-        self.inputs: Dict[str, Dict[str, QtWidgets.QLineEdit]] = {}
+            label = QtWidgets.QLabel(f"<b>{hdr}</b>")
+            label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, 0, col)
+
+        # Body part rows
+        self.inputs: Dict[str, Dict[str, QtWidgets.QComboBox]] = {}
         parts = ["Head", "Torso", "Chair", "Left Foot", "Right Foot", "Workspace", "Screen"]
+
         for row, part in enumerate(parts, start=1):
-            layout.addWidget(QtWidgets.QLabel(part), row, 0)
-            pos = QtWidgets.QLineEdit()
-            pos.setPlaceholderText("e.g. Head_x,Head_y,Head_z")
-            quat = QtWidgets.QLineEdit()
-            quat.setPlaceholderText("e.g. Mocap_Head_qx,...")
-            direction = QtWidgets.QLineEdit()
-            direction.setPlaceholderText("optional: dir_x,dir_y,dir_z")
-            layout.addWidget(pos, row, 1)
-            layout.addWidget(quat, row, 2)
-            layout.addWidget(direction, row, 3)
+            # Part label
+            part_label = QtWidgets.QLabel(part)
+            part_label.setMinimumWidth(80)
+            grid.addWidget(part_label, row, 0)
+
             key = part.lower().replace(" ", "_")
-            self.inputs[key] = {"pos": pos, "quat": quat, "dir": direction}
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
+            self.inputs[key] = {}
+
+            # Position combos (x, y, z)
+            for i, axis in enumerate(["x", "y", "z"]):
+                combo = self._create_column_combo(f"Position {axis.upper()}")
+                grid.addWidget(combo, row, 1 + i)
+                self.inputs[key][axis] = combo
+
+            # Quaternion combos (qx, qy, qz, qw)
+            for i, qaxis in enumerate(["qx", "qy", "qz", "qw"]):
+                combo = self._create_column_combo(f"Quat {qaxis}")
+                grid.addWidget(combo, row, 4 + i)
+                self.inputs[key][qaxis] = combo
+
+            # Direction combos (dx, dy, dz)
+            for i, daxis in enumerate(["dx", "dy", "dz"]):
+                combo = self._create_column_combo(f"Dir {daxis}")
+                grid.addWidget(combo, row, 8 + i)
+                self.inputs[key][daxis] = combo
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        # Auto-detect button
+        auto_btn = QtWidgets.QPushButton("Auto-detect from column names")
+        auto_btn.clicked.connect(self._auto_detect_mappings)
+        layout.addWidget(auto_btn)
+
+        # Validation status
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet("color: #666666;")
+        layout.addWidget(self.status_label)
+
+        # Dialog buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns, len(parts) + 1, 0, 1, len(headers))
+        layout.addWidget(btns)
+
+        # Set reasonable dialog size
+        self.resize(1100, 450)
+
+    def _create_column_combo(self, placeholder: str = "") -> QtWidgets.QComboBox:
+        """Create a searchable combo box populated with DataFrame columns.
+
+        Args:
+            placeholder: Placeholder text shown when empty
+
+        Returns:
+            Configured QComboBox with type-to-filter functionality
+        """
+        combo = QtWidgets.QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        combo.setMinimumWidth(100)
+
+        # Add empty option first (means "not mapped")
+        combo.addItem("")
+        combo.addItems(self.columns)
+
+        # Set placeholder text on the line edit
+        if combo.lineEdit():
+            combo.lineEdit().setPlaceholderText(placeholder)
+
+        # Configure completer for contains-matching
+        completer = combo.completer()
+        if completer:
+            completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+            completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+            completer.setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+
+        # Connect change signal for validation feedback
+        combo.currentTextChanged.connect(self._on_combo_changed)
+
+        return combo
+
+    def _on_combo_changed(self, text: str) -> None:
+        """Handle combo box text changes for validation feedback.
+
+        Args:
+            text: Current text in the combo box
+        """
+        combo = self.sender()
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+
+        # Validate: empty or valid column name
+        if text == "" or text in self.columns:
+            combo.setStyleSheet(self.VALID_STYLE)
+        else:
+            combo.setStyleSheet(self.INVALID_STYLE)
+
+        self._update_status()
+
+    def _update_status(self) -> None:
+        """Update the status label with mapping summary."""
+        mapped_parts = []
+        invalid_entries = []
+
+        for part_key, fields in self.inputs.items():
+            has_position = all(
+                fields[axis].currentText() in self.columns
+                for axis in ["x", "y", "z"]
+                if fields[axis].currentText()
+            )
+            pos_filled = any(fields[axis].currentText() for axis in ["x", "y", "z"])
+
+            if pos_filled and has_position:
+                # Check if all three position columns are filled
+                if all(fields[axis].currentText() for axis in ["x", "y", "z"]):
+                    mapped_parts.append(part_key.replace("_", " ").title())
+
+            # Check for invalid entries
+            for axis, combo in fields.items():
+                text = combo.currentText()
+                if text and text not in self.columns:
+                    invalid_entries.append(f"{part_key}/{axis}")
+
+        if invalid_entries:
+            self.status_label.setText(
+                f"Invalid columns: {', '.join(invalid_entries[:3])}{'...' if len(invalid_entries) > 3 else ''}"
+            )
+            self.status_label.setStyleSheet("color: #cc0000;")
+        elif mapped_parts:
+            self.status_label.setText(f"Mapped: {', '.join(mapped_parts)}")
+            self.status_label.setStyleSheet("color: #006600;")
+        else:
+            self.status_label.setText("No mappings configured")
+            self.status_label.setStyleSheet("color: #666666;")
+
+    def _auto_detect_mappings(self) -> None:
+        """Auto-detect column mappings based on common naming patterns.
+
+        Looks for patterns like:
+        - Head_x, Head_y, Head_z
+        - Mocap_Head_qx, Mocap_Head_qy, etc.
+        - left_foot_x, LEFT_FOOT_Y, etc.
+        """
+        # Define pattern mappings: (part_key, axis) -> list of column name patterns
+        patterns = {
+            # Position patterns
+            ("head", "x"): ["head_x", "Head_x", "HEAD_X", "mocap_head_x", "Mocap_Head_x"],
+            ("head", "y"): ["head_y", "Head_y", "HEAD_Y", "mocap_head_y", "Mocap_Head_y"],
+            ("head", "z"): ["head_z", "Head_z", "HEAD_Z", "mocap_head_z", "Mocap_Head_z"],
+            ("torso", "x"): ["torso_x", "Torso_x", "chest_x", "Chest_x", "TORSO_X"],
+            ("torso", "y"): ["torso_y", "Torso_y", "chest_y", "Chest_y", "TORSO_Y"],
+            ("torso", "z"): ["torso_z", "Torso_z", "chest_z", "Chest_z", "TORSO_Z"],
+            ("chair", "x"): ["chair_x", "Chair_x", "CHAIR_X"],
+            ("chair", "y"): ["chair_y", "Chair_y", "CHAIR_Y"],
+            ("chair", "z"): ["chair_z", "Chair_z", "CHAIR_Z"],
+            ("left_foot", "x"): ["left_foot_x", "Left_Foot_x", "LEFT_FOOT_X", "lfoot_x"],
+            ("left_foot", "y"): ["left_foot_y", "Left_Foot_y", "LEFT_FOOT_Y", "lfoot_y"],
+            ("left_foot", "z"): ["left_foot_z", "Left_Foot_z", "LEFT_FOOT_Z", "lfoot_z"],
+            ("right_foot", "x"): ["right_foot_x", "Right_Foot_x", "RIGHT_FOOT_X", "rfoot_x"],
+            ("right_foot", "y"): ["right_foot_y", "Right_Foot_y", "RIGHT_FOOT_Y", "rfoot_y"],
+            ("right_foot", "z"): ["right_foot_z", "Right_Foot_z", "RIGHT_FOOT_Z", "rfoot_z"],
+        }
+
+        # Also try generic suffix matching for quaternions
+        quat_suffixes = ["_qx", "_qy", "_qz", "_qw"]
+        dir_suffixes = ["_dx", "_dy", "_dz", "_dir_x", "_dir_y", "_dir_z"]
+
+        # Build a lowercase lookup for case-insensitive matching
+        col_lower_map = {c.lower(): c for c in self.columns}
+
+        detected_count = 0
+
+        for (part_key, axis), pattern_list in patterns.items():
+            if part_key not in self.inputs or axis not in self.inputs[part_key]:
+                continue
+            combo = self.inputs[part_key][axis]
+
+            # Try each pattern
+            for pattern in pattern_list:
+                if pattern in self.columns:
+                    combo.setCurrentText(pattern)
+                    detected_count += 1
+                    break
+                # Case-insensitive fallback
+                elif pattern.lower() in col_lower_map:
+                    combo.setCurrentText(col_lower_map[pattern.lower()])
+                    detected_count += 1
+                    break
+
+        # Try suffix-based detection for quaternions and directions
+        for part_key in self.inputs.keys():
+            part_name_variants = [
+                part_key,
+                part_key.replace("_", ""),
+                part_key.title().replace("_", ""),
+                part_key.upper().replace("_", "_"),
+            ]
+
+            # Quaternions
+            for qsuffix in quat_suffixes:
+                axis = qsuffix.strip("_")  # "qx", "qy", etc.
+                if axis not in self.inputs[part_key]:
+                    continue
+                combo = self.inputs[part_key][axis]
+                if combo.currentText():  # Already set
+                    continue
+
+                for variant in part_name_variants:
+                    candidate = f"{variant}{qsuffix}"
+                    if candidate in self.columns:
+                        combo.setCurrentText(candidate)
+                        detected_count += 1
+                        break
+                    elif candidate.lower() in col_lower_map:
+                        combo.setCurrentText(col_lower_map[candidate.lower()])
+                        detected_count += 1
+                        break
+
+        self._update_status()
+
+        if detected_count > 0:
+            self.status_label.setText(
+                f"Auto-detected {detected_count} column mapping(s). " + self.status_label.text()
+            )
+
+    def _validate_and_accept(self) -> None:
+        """Validate all entries before accepting the dialog."""
+        errors = []
+
+        for part_key, fields in self.inputs.items():
+            for axis, combo in fields.items():
+                text = combo.currentText()
+                if text and text not in self.columns:
+                    errors.append(f"{part_key}/{axis}: '{text}' is not a valid column")
+
+            # Check for partial position mappings (some but not all x/y/z)
+            pos_filled = [fields[a].currentText() for a in ["x", "y", "z"]]
+            filled_count = sum(1 for p in pos_filled if p)
+            if 0 < filled_count < 3:
+                errors.append(
+                    f"{part_key}: Position requires all 3 columns (x, y, z) or none"
+                )
+
+            # Check for partial quaternion mappings
+            quat_filled = [fields[a].currentText() for a in ["qx", "qy", "qz", "qw"]]
+            qfilled_count = sum(1 for q in quat_filled if q)
+            if 0 < qfilled_count < 4:
+                errors.append(
+                    f"{part_key}: Quaternion requires all 4 columns or none"
+                )
+
+            # Check for partial direction mappings
+            dir_filled = [fields[a].currentText() for a in ["dx", "dy", "dz"]]
+            dfilled_count = sum(1 for d in dir_filled if d)
+            if 0 < dfilled_count < 3:
+                errors.append(
+                    f"{part_key}: Direction requires all 3 columns or none"
+                )
+
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Mappings",
+                "Please fix the following issues:\n\n" + "\n".join(errors[:5]) +
+                ("\n..." if len(errors) > 5 else "")
+            )
+            return
+
+        self.accept()
 
     def mapping(self) -> Dict[str, Dict[str, str]]:
-        mapping: Dict[str, Dict[str, str]] = {}
-        for key, fields in self.inputs.items():
-            pos_txt = fields["pos"].text().strip()
-            quat_txt = fields["quat"].text().strip()
-            dir_txt = fields["dir"].text().strip()
+        """Extract the mapping configuration from the dialog.
+
+        Returns:
+            Dictionary mapping part keys to their column assignments.
+            Example: {"head": {"x": "Head_x", "y": "Head_y", "z": "Head_z"}}
+        """
+        result: Dict[str, Dict[str, str]] = {}
+
+        for part_key, fields in self.inputs.items():
             entry: Dict[str, str] = {}
-            if pos_txt:
-                parts = [p.strip() for p in pos_txt.split(",") if p.strip()]
-                if len(parts) == 3:
-                    entry.update({"x": parts[0], "y": parts[1], "z": parts[2]})
-            if quat_txt:
-                parts = [p.strip() for p in quat_txt.split(",") if p.strip()]
-                if len(parts) == 4:
-                    entry.update({"qx": parts[0], "qy": parts[1], "qz": parts[2], "qw": parts[3]})
-            if dir_txt:
-                parts = [p.strip() for p in dir_txt.split(",") if p.strip()]
-                if len(parts) == 3:
-                    entry.update({"dx": parts[0], "dy": parts[1], "dz": parts[2]})
+
+            # Position columns
+            for axis in ["x", "y", "z"]:
+                col = fields[axis].currentText()
+                if col and col in self.columns:
+                    entry[axis] = col
+
+            # Quaternion columns
+            for axis in ["qx", "qy", "qz", "qw"]:
+                col = fields[axis].currentText()
+                if col and col in self.columns:
+                    entry[axis] = col
+
+            # Direction columns
+            for axis in ["dx", "dy", "dz"]:
+                col = fields[axis].currentText()
+                if col and col in self.columns:
+                    entry[axis] = col
+
             if entry:
-                mapping[key] = entry
-        return mapping
+                result[part_key] = entry
+
+        return result
+
+    def set_mapping(self, mapping: Dict[str, Dict[str, str]]) -> None:
+        """Pre-populate the dialog with an existing mapping.
+
+        Args:
+            mapping: Previously saved mapping configuration
+        """
+        for part_key, columns in mapping.items():
+            if part_key not in self.inputs:
+                continue
+
+            for axis, col_name in columns.items():
+                if axis in self.inputs[part_key]:
+                    combo = self.inputs[part_key][axis]
+                    if col_name in self.columns:
+                        combo.setCurrentText(col_name)
+
+        self._update_status()
 
 
 class CompareTrialsDialog(QtWidgets.QDialog):
@@ -773,34 +1580,311 @@ class FilterPreviewDialog(QtWidgets.QDialog):
 
 
 class CalibrationWizard(QtWidgets.QDialog):
-    """Estimate frame heading offset using a calibration window."""
+    """Estimate frame heading offset using a calibration window with real-time preview.
 
-    def __init__(self, channels: List[str], parent: QtWidgets.QWidget | None = None) -> None:
+    Features:
+    - Preview plot showing source and reference channels
+    - Shaded region indicating calibration window
+    - Quality metrics (offset, std dev, range, sample count)
+    - Quality indicator (green/yellow/red based on std deviation)
+    - Integration with current plot selection
+    """
+
+    # Quality thresholds for std deviation (in degrees)
+    QUALITY_GOOD = 2.0      # Green: < 2 degrees
+    QUALITY_MARGINAL = 5.0  # Yellow: 2-5 degrees, Red: >= 5 degrees
+
+    def __init__(
+        self,
+        channels: List[str],
+        df: pd.DataFrame | None = None,
+        current_selection: Tuple[float, float] | None = None,
+        parent: QtWidgets.QWidget | None = None
+    ) -> None:
+        """Initialize the calibration wizard.
+
+        Args:
+            channels: List of available signal column names
+            df: DataFrame containing the data for preview (optional)
+            current_selection: Tuple of (start, end) times from plot selection (optional)
+            parent: Parent widget
+        """
         super().__init__(parent)
         self.setWindowTitle("Calibration Wizard")
-        layout = QtWidgets.QFormLayout(self)
+        self.resize(700, 550)
+
+        self.channels = channels
+        self.df = df
+        self.current_selection = current_selection
+
+        self._setup_ui()
+        self._connect_signals()
+
+        # Initialize preview if we have data
+        if self.df is not None and len(self.channels) > 0:
+            self._update_preview()
+
+    def _setup_ui(self) -> None:
+        """Build the dialog UI with preview plot and metrics."""
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        # Top section: Channel selection and time range
+        form_layout = QtWidgets.QFormLayout()
+
+        # Channel selection
         self.src_combo = QtWidgets.QComboBox()
-        self.src_combo.addItems(channels)
+        self.src_combo.addItems(self.channels)
         self.ref_combo = QtWidgets.QComboBox()
-        self.ref_combo.addItems(channels)
+        self.ref_combo.addItems(self.channels)
+        # Default to second channel for reference if available
+        if len(self.channels) > 1:
+            self.ref_combo.setCurrentIndex(1)
+
+        form_layout.addRow("Source heading:", self.src_combo)
+        form_layout.addRow("Reference heading:", self.ref_combo)
+
+        # Time range selection with "Use Current Selection" button
+        time_layout = QtWidgets.QHBoxLayout()
         self.start_spin = QtWidgets.QDoubleSpinBox()
         self.start_spin.setRange(0, 1e6)
         self.start_spin.setDecimals(3)
+        self.start_spin.setSuffix(" s")
         self.end_spin = QtWidgets.QDoubleSpinBox()
         self.end_spin.setRange(0, 1e6)
         self.end_spin.setDecimals(3)
-        layout.addRow("Source heading", self.src_combo)
-        layout.addRow("Reference heading", self.ref_combo)
-        layout.addRow("Start time (s)", self.start_spin)
-        layout.addRow("End time (s)", self.end_spin)
+        self.end_spin.setSuffix(" s")
+        self.end_spin.setValue(1.0)  # Default 1 second window
+
+        time_layout.addWidget(QtWidgets.QLabel("Start:"))
+        time_layout.addWidget(self.start_spin)
+        time_layout.addWidget(QtWidgets.QLabel("End:"))
+        time_layout.addWidget(self.end_spin)
+
+        self.use_selection_btn = QtWidgets.QPushButton("Use Current Selection")
+        self.use_selection_btn.setToolTip("Populate start/end from the current plot selection")
+        self.use_selection_btn.setEnabled(self.current_selection is not None)
+        time_layout.addWidget(self.use_selection_btn)
+
+        form_layout.addRow("Calibration window:", time_layout)
+
+        # Frame name
         self.name_edit = QtWidgets.QLineEdit()
-        layout.addRow("Save as frame name", self.name_edit)
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.name_edit.setPlaceholderText("e.g., gaze_vs_head")
+        form_layout.addRow("Save as frame name:", self.name_edit)
+
+        main_layout.addLayout(form_layout)
+
+        # Separator
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        main_layout.addWidget(line)
+
+        # Preview plot
+        plot_label = QtWidgets.QLabel("<b>Preview</b>")
+        main_layout.addWidget(plot_label)
+
+        self.preview_plot = pg.PlotWidget()
+        self.preview_plot.setBackground('w')
+        self.preview_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.preview_plot.setLabel('bottom', 'Time', units='s')
+        self.preview_plot.setLabel('left', 'Heading', units='deg')
+        self.preview_plot.addLegend(offset=(10, 10))
+        main_layout.addWidget(self.preview_plot, stretch=1)
+
+        # Create plot items
+        self.src_curve = self.preview_plot.plot([], [], pen=pg.mkPen(color=(100, 143, 255), width=2), name="Source")
+        self.ref_curve = self.preview_plot.plot([], [], pen=pg.mkPen(color=(220, 38, 127), width=2), name="Reference")
+
+        # Calibration window region
+        self.cal_region = pg.LinearRegionItem(
+            values=(0, 1),
+            brush=(100, 200, 100, 50),
+            pen=pg.mkPen(color=(50, 150, 50), width=2),
+            movable=False
+        )
+        self.cal_region.setZValue(-10)
+        self.preview_plot.addItem(self.cal_region)
+
+        # Quality metrics section
+        metrics_group = QtWidgets.QGroupBox("Calibration Quality Metrics")
+        metrics_layout = QtWidgets.QGridLayout(metrics_group)
+
+        # Offset
+        metrics_layout.addWidget(QtWidgets.QLabel("Offset (mean):"), 0, 0)
+        self.offset_label = QtWidgets.QLabel("--")
+        self.offset_label.setStyleSheet("font-weight: bold;")
+        metrics_layout.addWidget(self.offset_label, 0, 1)
+
+        # Standard deviation
+        metrics_layout.addWidget(QtWidgets.QLabel("Std deviation:"), 0, 2)
+        self.std_label = QtWidgets.QLabel("--")
+        metrics_layout.addWidget(self.std_label, 0, 3)
+
+        # Range
+        metrics_layout.addWidget(QtWidgets.QLabel("Range (max-min):"), 1, 0)
+        self.range_label = QtWidgets.QLabel("--")
+        metrics_layout.addWidget(self.range_label, 1, 1)
+
+        # Sample count
+        metrics_layout.addWidget(QtWidgets.QLabel("Sample count:"), 1, 2)
+        self.count_label = QtWidgets.QLabel("--")
+        metrics_layout.addWidget(self.count_label, 1, 3)
+
+        # Quality indicator
+        metrics_layout.addWidget(QtWidgets.QLabel("Quality:"), 2, 0)
+        self.quality_indicator = QtWidgets.QLabel("--")
+        metrics_layout.addWidget(self.quality_indicator, 2, 1, 1, 3)
+
+        main_layout.addWidget(metrics_group)
+
+        # Dialog buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        layout.addRow(btns)
+        main_layout.addWidget(btns)
+
+    def _connect_signals(self) -> None:
+        """Connect UI signals for real-time updates."""
+        self.src_combo.currentTextChanged.connect(self._update_preview)
+        self.ref_combo.currentTextChanged.connect(self._update_preview)
+        self.start_spin.valueChanged.connect(self._update_preview)
+        self.end_spin.valueChanged.connect(self._update_preview)
+        self.use_selection_btn.clicked.connect(self._use_current_selection)
+
+    def _use_current_selection(self) -> None:
+        """Populate time spinboxes from the current plot selection."""
+        if self.current_selection is not None:
+            start, end = self.current_selection
+            # Block signals to avoid multiple preview updates
+            self.start_spin.blockSignals(True)
+            self.end_spin.blockSignals(True)
+            self.start_spin.setValue(start)
+            self.end_spin.setValue(end)
+            self.start_spin.blockSignals(False)
+            self.end_spin.blockSignals(False)
+            self._update_preview()
+
+    def _update_preview(self) -> None:
+        """Update the preview plot and quality metrics."""
+        if self.df is None or self.df.empty:
+            self._clear_metrics()
+            return
+
+        src_col = self.src_combo.currentText()
+        ref_col = self.ref_combo.currentText()
+
+        if not src_col or not ref_col:
+            self._clear_metrics()
+            return
+
+        if src_col not in self.df.columns or ref_col not in self.df.columns:
+            self._clear_metrics()
+            return
+
+        # Get time column
+        time_col = None
+        if 'normalized_time' in self.df.columns:
+            time_col = 'normalized_time'
+        else:
+            for col in self.df.columns:
+                if 'time' in col.lower():
+                    time_col = col
+                    break
+
+        if time_col is None:
+            # Use index as time
+            time_data = np.arange(len(self.df))
+        else:
+            time_data = self.df[time_col].values
+
+        src_data = self.df[src_col].values
+        ref_data = self.df[ref_col].values
+
+        # Update plot curves
+        self.src_curve.setData(time_data, src_data)
+        self.ref_curve.setData(time_data, ref_data)
+
+        # Update calibration region
+        start_time = self.start_spin.value()
+        end_time = self.end_spin.value()
+        self.cal_region.setRegion((start_time, end_time))
+
+        # Compute metrics for the calibration window
+        mask = (time_data >= start_time) & (time_data <= end_time)
+        window_src = src_data[mask]
+        window_ref = ref_data[mask]
+
+        if len(window_src) == 0 or len(window_ref) == 0:
+            self._clear_metrics()
+            return
+
+        # Compute difference (source - reference)
+        diff = window_src - window_ref
+
+        # Handle NaN values
+        valid_diff = diff[~np.isnan(diff)]
+        if len(valid_diff) == 0:
+            self._clear_metrics()
+            return
+
+        offset = float(np.mean(valid_diff))
+        std_dev = float(np.std(valid_diff))
+        value_range = float(np.max(valid_diff) - np.min(valid_diff))
+        sample_count = len(valid_diff)
+
+        # Update metric labels
+        self.offset_label.setText(f"{offset:.3f} deg")
+        self.std_label.setText(f"{std_dev:.3f} deg")
+        self.range_label.setText(f"{value_range:.3f} deg")
+        self.count_label.setText(str(sample_count))
+
+        # Update quality indicator
+        self._update_quality_indicator(std_dev)
+
+    def _clear_metrics(self) -> None:
+        """Reset all metric displays to default state."""
+        self.offset_label.setText("--")
+        self.std_label.setText("--")
+        self.range_label.setText("--")
+        self.count_label.setText("--")
+        self.quality_indicator.setText("No data in window")
+        self.quality_indicator.setStyleSheet("")
+
+    def _update_quality_indicator(self, std_dev: float) -> None:
+        """Update the quality indicator based on standard deviation.
+
+        Args:
+            std_dev: Standard deviation of the difference signal in degrees
+        """
+        if std_dev < self.QUALITY_GOOD:
+            # Green - good quality
+            color = "#22aa22"
+            dot = "<span style='color: #22aa22; font-size: 16px;'>&#9679;</span>"
+            text = f"{dot} Good (std < {self.QUALITY_GOOD} deg)"
+        elif std_dev < self.QUALITY_MARGINAL:
+            # Yellow - marginal quality
+            color = "#cc9900"
+            dot = "<span style='color: #cc9900; font-size: 16px;'>&#9679;</span>"
+            text = f"{dot} Marginal ({self.QUALITY_GOOD}-{self.QUALITY_MARGINAL} deg)"
+        else:
+            # Red - poor quality
+            color = "#cc2222"
+            dot = "<span style='color: #cc2222; font-size: 16px;'>&#9679;</span>"
+            text = f"{dot} Poor (std >= {self.QUALITY_MARGINAL} deg)"
+
+        self.quality_indicator.setText(text)
+        self.quality_indicator.setStyleSheet(f"font-weight: bold;")
 
     def params(self) -> Dict:
+        """Return the calibration parameters.
+
+        Returns:
+            Dictionary with keys: src, ref, start, end, name
+        """
         return {
             "src": self.src_combo.currentText(),
             "ref": self.ref_combo.currentText(),
@@ -1115,4 +2199,516 @@ class ExportCSVDialog(QtWidgets.QDialog):
             "embed_annotations": self.embed_chk.isChecked(),
             "manual_indices": self.manual_indices if self.manual_radio.isChecked() else None,
         }
+
+
+class RelativeOrientationDialog(QtWidgets.QDialog):
+    """Compute relative orientation between two segments.
+
+    Supports two modes:
+    - Simple Heading: Computes relative heading between two heading columns
+    - Full Quaternion: Computes relative rotation (yaw, pitch, roll) from quaternions
+
+    Features:
+    - Mode toggle between simple and quaternion computation
+    - Preview plot showing computed relative angles
+    - Output channel naming
+    - Integration with FilterEngine for quaternion math
+    """
+
+    def __init__(
+        self,
+        columns: List[str],
+        df: pd.DataFrame,
+        parent: QtWidgets.QWidget | None = None
+    ) -> None:
+        """Initialize the relative orientation dialog.
+
+        Args:
+            columns: List of available signal column names
+            df: DataFrame containing the data for computation and preview
+            parent: Parent widget
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Relative Orientation")
+        self.resize(750, 600)
+
+        self.columns = sorted(columns)
+        self.df = df
+        self.result_yaw: np.ndarray | None = None
+        self.result_pitch: np.ndarray | None = None
+        self.result_roll: np.ndarray | None = None
+        self.result_heading: np.ndarray | None = None
+
+        self._setup_ui()
+        self._connect_signals()
+        self._on_mode_changed()
+
+    def _setup_ui(self) -> None:
+        """Build the dialog UI."""
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        # Mode selection
+        mode_group = QtWidgets.QGroupBox("Computation Mode")
+        mode_layout = QtWidgets.QHBoxLayout(mode_group)
+
+        self.heading_radio = QtWidgets.QRadioButton("Simple Heading")
+        self.heading_radio.setToolTip(
+            "Compute relative heading from two heading columns (degrees).\n"
+            "Result: (source - target - offset) wrapped to [-180, 180]"
+        )
+        self.heading_radio.setChecked(True)
+
+        self.quat_radio = QtWidgets.QRadioButton("Full Quaternion")
+        self.quat_radio.setToolTip(
+            "Compute full 3D relative rotation from quaternion columns.\n"
+            "Result: Yaw, Pitch, Roll angles in degrees"
+        )
+
+        mode_layout.addWidget(self.heading_radio)
+        mode_layout.addWidget(self.quat_radio)
+        mode_layout.addStretch()
+        main_layout.addWidget(mode_group)
+
+        # Stacked widget for mode-specific inputs
+        self.input_stack = QtWidgets.QStackedWidget()
+
+        # --- Simple Heading Page ---
+        heading_page = QtWidgets.QWidget()
+        heading_layout = QtWidgets.QFormLayout(heading_page)
+
+        self.source_heading_combo = self._create_column_combo("Source heading (degrees)")
+        self.target_heading_combo = self._create_column_combo("Target/reference heading")
+        self.offset_spin = QtWidgets.QDoubleSpinBox()
+        self.offset_spin.setRange(-360.0, 360.0)
+        self.offset_spin.setDecimals(2)
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.setSuffix(" deg")
+        self.heading_output_edit = QtWidgets.QLineEdit()
+        self.heading_output_edit.setPlaceholderText("e.g., gaze_vs_head")
+
+        heading_layout.addRow("Source heading:", self.source_heading_combo)
+        heading_layout.addRow("Target heading:", self.target_heading_combo)
+        heading_layout.addRow("Offset:", self.offset_spin)
+        heading_layout.addRow("Output channel name:", self.heading_output_edit)
+
+        heading_help = QtWidgets.QLabel(
+            "Computes: ((source - target - offset + 180) % 360) - 180\n"
+            "Result is wrapped to [-180, 180] degrees."
+        )
+        heading_help.setStyleSheet("color: gray; font-size: 10px;")
+        heading_help.setWordWrap(True)
+        heading_layout.addRow(heading_help)
+
+        self.input_stack.addWidget(heading_page)
+
+        # --- Quaternion Page ---
+        quat_page = QtWidgets.QWidget()
+        quat_layout = QtWidgets.QVBoxLayout(quat_page)
+
+        # Parent quaternion group
+        parent_group = QtWidgets.QGroupBox("Parent Segment Quaternion")
+        parent_form = QtWidgets.QFormLayout(parent_group)
+        self.parent_qw = self._create_column_combo("qw")
+        self.parent_qx = self._create_column_combo("qx")
+        self.parent_qy = self._create_column_combo("qy")
+        self.parent_qz = self._create_column_combo("qz")
+        parent_form.addRow("qw:", self.parent_qw)
+        parent_form.addRow("qx:", self.parent_qx)
+        parent_form.addRow("qy:", self.parent_qy)
+        parent_form.addRow("qz:", self.parent_qz)
+        quat_layout.addWidget(parent_group)
+
+        # Child quaternion group
+        child_group = QtWidgets.QGroupBox("Child Segment Quaternion")
+        child_form = QtWidgets.QFormLayout(child_group)
+        self.child_qw = self._create_column_combo("qw")
+        self.child_qx = self._create_column_combo("qx")
+        self.child_qy = self._create_column_combo("qy")
+        self.child_qz = self._create_column_combo("qz")
+        child_form.addRow("qw:", self.child_qw)
+        child_form.addRow("qx:", self.child_qx)
+        child_form.addRow("qy:", self.child_qy)
+        child_form.addRow("qz:", self.child_qz)
+        quat_layout.addWidget(child_group)
+
+        # Output names
+        output_group = QtWidgets.QGroupBox("Output Channel Names")
+        output_form = QtWidgets.QFormLayout(output_group)
+        self.yaw_output_edit = QtWidgets.QLineEdit()
+        self.yaw_output_edit.setPlaceholderText("e.g., relative_yaw")
+        self.pitch_output_edit = QtWidgets.QLineEdit()
+        self.pitch_output_edit.setPlaceholderText("e.g., relative_pitch")
+        self.roll_output_edit = QtWidgets.QLineEdit()
+        self.roll_output_edit.setPlaceholderText("e.g., relative_roll")
+        output_form.addRow("Yaw (Z rotation):", self.yaw_output_edit)
+        output_form.addRow("Pitch (Y rotation):", self.pitch_output_edit)
+        output_form.addRow("Roll (X rotation):", self.roll_output_edit)
+
+        quat_help = QtWidgets.QLabel(
+            "Computes: child * inverse(parent) using Hamilton product.\n"
+            "Leave output name empty to skip that angle."
+        )
+        quat_help.setStyleSheet("color: gray; font-size: 10px;")
+        quat_help.setWordWrap(True)
+        output_form.addRow(quat_help)
+
+        quat_layout.addWidget(output_group)
+        quat_layout.addStretch()
+
+        self.input_stack.addWidget(quat_page)
+
+        main_layout.addWidget(self.input_stack)
+
+        # Auto-detect button
+        auto_btn = QtWidgets.QPushButton("Auto-detect columns")
+        auto_btn.clicked.connect(self._auto_detect)
+        main_layout.addWidget(auto_btn)
+
+        # Preview section
+        preview_group = QtWidgets.QGroupBox("Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+
+        self.preview_plot = pg.PlotWidget()
+        self.preview_plot.setBackground('w')
+        self.preview_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.preview_plot.setLabel('bottom', 'Time', units='s')
+        self.preview_plot.setLabel('left', 'Angle', units='deg')
+        self.preview_plot.addLegend(offset=(10, 10))
+        preview_layout.addWidget(self.preview_plot)
+
+        preview_btn_layout = QtWidgets.QHBoxLayout()
+        self.compute_btn = QtWidgets.QPushButton("Compute Preview")
+        self.compute_btn.clicked.connect(self._compute_preview)
+        preview_btn_layout.addWidget(self.compute_btn)
+        preview_btn_layout.addStretch()
+        preview_layout.addLayout(preview_btn_layout)
+
+        main_layout.addWidget(preview_group, stretch=1)
+
+        # Status label
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet("color: gray;")
+        main_layout.addWidget(self.status_label)
+
+        # Dialog buttons
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        main_layout.addWidget(btns)
+
+    def _create_column_combo(self, placeholder: str = "") -> QtWidgets.QComboBox:
+        """Create a searchable combo box populated with DataFrame columns."""
+        combo = QtWidgets.QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        combo.setMinimumWidth(150)
+
+        combo.addItem("")
+        combo.addItems(self.columns)
+
+        if combo.lineEdit():
+            combo.lineEdit().setPlaceholderText(placeholder)
+
+        completer = combo.completer()
+        if completer:
+            completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+            completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+
+        return combo
+
+    def _connect_signals(self) -> None:
+        """Connect UI signals."""
+        self.heading_radio.toggled.connect(self._on_mode_changed)
+        self.quat_radio.toggled.connect(self._on_mode_changed)
+
+    def _on_mode_changed(self) -> None:
+        """Switch between heading and quaternion input modes."""
+        if self.heading_radio.isChecked():
+            self.input_stack.setCurrentIndex(0)
+        else:
+            self.input_stack.setCurrentIndex(1)
+        self.preview_plot.clear()
+        self.status_label.setText("")
+
+    def _auto_detect(self) -> None:
+        """Auto-detect column mappings based on naming patterns."""
+        detected = 0
+        col_lower_map = {c.lower(): c for c in self.columns}
+
+        if self.heading_radio.isChecked():
+            # Detect heading columns
+            heading_patterns = ['heading', 'yaw', 'azimuth', 'direction']
+            found_headings = []
+            for col in self.columns:
+                col_l = col.lower()
+                if any(p in col_l for p in heading_patterns):
+                    found_headings.append(col)
+
+            if len(found_headings) >= 1:
+                self.source_heading_combo.setCurrentText(found_headings[0])
+                detected += 1
+            if len(found_headings) >= 2:
+                self.target_heading_combo.setCurrentText(found_headings[1])
+                detected += 1
+
+            if not self.heading_output_edit.text() and len(found_headings) >= 2:
+                # Suggest output name
+                src = found_headings[0].replace('_heading', '').replace('heading', 'src')
+                tgt = found_headings[1].replace('_heading', '').replace('heading', 'ref')
+                self.heading_output_edit.setText(f"{src}_vs_{tgt}")
+
+        else:
+            # Detect quaternion columns
+            quat_combos = [
+                (self.parent_qw, ['head_qw', 'torso_qw', 'chest_qw', 'parent_qw']),
+                (self.parent_qx, ['head_qx', 'torso_qx', 'chest_qx', 'parent_qx']),
+                (self.parent_qy, ['head_qy', 'torso_qy', 'chest_qy', 'parent_qy']),
+                (self.parent_qz, ['head_qz', 'torso_qz', 'chest_qz', 'parent_qz']),
+            ]
+            child_combos = [
+                (self.child_qw, ['gaze_qw', 'eye_qw', 'child_qw']),
+                (self.child_qx, ['gaze_qx', 'eye_qx', 'child_qx']),
+                (self.child_qy, ['gaze_qy', 'eye_qy', 'child_qy']),
+                (self.child_qz, ['gaze_qz', 'eye_qz', 'child_qz']),
+            ]
+
+            for combo, patterns in quat_combos + child_combos:
+                for pattern in patterns:
+                    if pattern in self.columns:
+                        combo.setCurrentText(pattern)
+                        detected += 1
+                        break
+                    elif pattern.lower() in col_lower_map:
+                        combo.setCurrentText(col_lower_map[pattern.lower()])
+                        detected += 1
+                        break
+
+        if detected > 0:
+            self.status_label.setText(f"Auto-detected {detected} column(s)")
+            self.status_label.setStyleSheet("color: green;")
+        else:
+            self.status_label.setText("No columns auto-detected")
+            self.status_label.setStyleSheet("color: orange;")
+
+    def _compute_preview(self) -> None:
+        """Compute and display preview of relative orientation."""
+        from filter_engine import FilterEngine
+
+        self.preview_plot.clear()
+        self.result_yaw = None
+        self.result_pitch = None
+        self.result_roll = None
+        self.result_heading = None
+
+        if self.df is None or self.df.empty:
+            self.status_label.setText("No data available")
+            self.status_label.setStyleSheet("color: red;")
+            return
+
+        # Get time column
+        if 'normalized_time' in self.df.columns:
+            time = self.df['normalized_time'].values
+        else:
+            time = np.arange(len(self.df))
+
+        engine = FilterEngine()
+
+        try:
+            if self.heading_radio.isChecked():
+                # Simple heading mode
+                src = self.source_heading_combo.currentText()
+                tgt = self.target_heading_combo.currentText()
+                offset = self.offset_spin.value()
+
+                if not src or src not in self.df.columns:
+                    self.status_label.setText("Invalid source heading column")
+                    self.status_label.setStyleSheet("color: red;")
+                    return
+                if not tgt or tgt not in self.df.columns:
+                    self.status_label.setText("Invalid target heading column")
+                    self.status_label.setStyleSheet("color: red;")
+                    return
+
+                self.result_heading = engine.relative_heading(self.df, src, tgt, offset)
+
+                # Plot
+                self.preview_plot.plot(
+                    time, self.result_heading,
+                    pen=pg.mkPen(color=(100, 143, 255), width=2),
+                    name="Relative Heading"
+                )
+                self.status_label.setText(
+                    f"Mean: {np.nanmean(self.result_heading):.2f} deg, "
+                    f"Std: {np.nanstd(self.result_heading):.2f} deg"
+                )
+                self.status_label.setStyleSheet("color: green;")
+
+            else:
+                # Quaternion mode
+                pqw = self.parent_qw.currentText()
+                pqx = self.parent_qx.currentText()
+                pqy = self.parent_qy.currentText()
+                pqz = self.parent_qz.currentText()
+                cqw = self.child_qw.currentText()
+                cqx = self.child_qx.currentText()
+                cqy = self.child_qy.currentText()
+                cqz = self.child_qz.currentText()
+
+                # Validate all columns exist
+                for col_name, label in [
+                    (pqw, "Parent qw"), (pqx, "Parent qx"),
+                    (pqy, "Parent qy"), (pqz, "Parent qz"),
+                    (cqw, "Child qw"), (cqx, "Child qx"),
+                    (cqy, "Child qy"), (cqz, "Child qz"),
+                ]:
+                    if not col_name or col_name not in self.df.columns:
+                        self.status_label.setText(f"Invalid column: {label}")
+                        self.status_label.setStyleSheet("color: red;")
+                        return
+
+                yaw, pitch, roll = engine.relative_rotation(
+                    self.df,
+                    pqw, pqx, pqy, pqz,
+                    cqw, cqx, cqy, cqz
+                )
+                self.result_yaw = yaw
+                self.result_pitch = pitch
+                self.result_roll = roll
+
+                # Plot all three
+                self.preview_plot.plot(
+                    time, yaw,
+                    pen=pg.mkPen(color=(100, 143, 255), width=2),
+                    name="Yaw"
+                )
+                self.preview_plot.plot(
+                    time, pitch,
+                    pen=pg.mkPen(color=(220, 38, 127), width=2),
+                    name="Pitch"
+                )
+                self.preview_plot.plot(
+                    time, roll,
+                    pen=pg.mkPen(color=(254, 97, 0), width=2),
+                    name="Roll"
+                )
+
+                self.status_label.setText(
+                    f"Yaw: {np.nanmean(yaw):.1f} +/- {np.nanstd(yaw):.1f}, "
+                    f"Pitch: {np.nanmean(pitch):.1f} +/- {np.nanstd(pitch):.1f}, "
+                    f"Roll: {np.nanmean(roll):.1f} +/- {np.nanstd(roll):.1f}"
+                )
+                self.status_label.setStyleSheet("color: green;")
+
+        except Exception as e:
+            self.status_label.setText(f"Error: {str(e)}")
+            self.status_label.setStyleSheet("color: red;")
+
+    def _validate_and_accept(self) -> None:
+        """Validate inputs and accept dialog."""
+        if self.heading_radio.isChecked():
+            src = self.source_heading_combo.currentText()
+            tgt = self.target_heading_combo.currentText()
+            output = self.heading_output_edit.text().strip()
+
+            if not src or src not in self.columns:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Input",
+                    "Please select a valid source heading column."
+                )
+                return
+            if not tgt or tgt not in self.columns:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Input",
+                    "Please select a valid target heading column."
+                )
+                return
+            if not output:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Input",
+                    "Please specify an output channel name."
+                )
+                return
+
+        else:
+            # Validate quaternion columns
+            quat_cols = [
+                (self.parent_qw, "Parent qw"),
+                (self.parent_qx, "Parent qx"),
+                (self.parent_qy, "Parent qy"),
+                (self.parent_qz, "Parent qz"),
+                (self.child_qw, "Child qw"),
+                (self.child_qx, "Child qx"),
+                (self.child_qy, "Child qy"),
+                (self.child_qz, "Child qz"),
+            ]
+            for combo, label in quat_cols:
+                col = combo.currentText()
+                if not col or col not in self.columns:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Invalid Input",
+                        f"Please select a valid column for {label}."
+                    )
+                    return
+
+            # At least one output must be specified
+            yaw_name = self.yaw_output_edit.text().strip()
+            pitch_name = self.pitch_output_edit.text().strip()
+            roll_name = self.roll_output_edit.text().strip()
+            if not any([yaw_name, pitch_name, roll_name]):
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Input",
+                    "Please specify at least one output channel name."
+                )
+                return
+
+        self.accept()
+
+    def is_heading_mode(self) -> bool:
+        """Return True if using simple heading mode."""
+        return self.heading_radio.isChecked()
+
+    def params(self) -> Dict:
+        """Return the computation parameters.
+
+        For heading mode:
+            {"mode": "heading", "source": str, "target": str, "offset": float, "output": str}
+
+        For quaternion mode:
+            {"mode": "quaternion",
+             "parent": {"qw": str, "qx": str, "qy": str, "qz": str},
+             "child": {"qw": str, "qx": str, "qy": str, "qz": str},
+             "outputs": {"yaw": str|None, "pitch": str|None, "roll": str|None}}
+        """
+        if self.heading_radio.isChecked():
+            return {
+                "mode": "heading",
+                "source": self.source_heading_combo.currentText(),
+                "target": self.target_heading_combo.currentText(),
+                "offset": self.offset_spin.value(),
+                "output": self.heading_output_edit.text().strip(),
+            }
+        else:
+            return {
+                "mode": "quaternion",
+                "parent": {
+                    "qw": self.parent_qw.currentText(),
+                    "qx": self.parent_qx.currentText(),
+                    "qy": self.parent_qy.currentText(),
+                    "qz": self.parent_qz.currentText(),
+                },
+                "child": {
+                    "qw": self.child_qw.currentText(),
+                    "qx": self.child_qx.currentText(),
+                    "qy": self.child_qy.currentText(),
+                    "qz": self.child_qz.currentText(),
+                },
+                "outputs": {
+                    "yaw": self.yaw_output_edit.text().strip() or None,
+                    "pitch": self.pitch_output_edit.text().strip() or None,
+                    "roll": self.roll_output_edit.text().strip() or None,
+                },
+            }
 

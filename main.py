@@ -31,13 +31,83 @@ class InteractionMode(Enum):
     ANNOTATION = auto()   # Creating new annotations
     EDIT = auto()         # Editing existing annotations
 
+import re
+import shutil
+import tempfile
+
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters  # noqa: F401 - module provides exporters used dynamically
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from data_model import AnnotationSegment, DataModel
+
+# Security: Patterns to block in plugin expressions
+DANGEROUS_EXPRESSION_PATTERNS = [
+    r'\b__\w+__\b',  # Dunder attributes (e.g., __import__, __class__)
+    r'\bimport\b',   # Import statements
+    r'\bexec\b',     # Exec function
+    r'\beval\b',     # Eval function
+    r'\bcompile\b',  # Compile function
+    r'\bopen\b',     # File operations
+    r'\bos\.',       # OS module access
+    r'\bsys\.',      # Sys module access
+    r'\bsubprocess\.',  # Subprocess module
+    r'\bbuiltins\.',    # Builtins access
+    r'\bglobals\b',     # Globals access
+    r'\blocals\b',      # Locals access
+    r'\bgetattr\b',     # Attribute access
+    r'\bsetattr\b',     # Attribute setting
+    r'\bdelattr\b',     # Attribute deletion
+]
+
+# Safe functions allowed in expressions
+SAFE_EXPRESSION_FUNCTIONS = {
+    'abs', 'sqrt', 'sin', 'cos', 'tan', 'log', 'log10', 'exp', 'pow',
+    'mean', 'std', 'min', 'max', 'sum', 'median', 'var',
+    'floor', 'ceil', 'round', 'clip',
+}
+
+
+def validate_plugin_expression(expr: str, available_columns: List[str]) -> Tuple[bool, str]:
+    """Validate a plugin expression for security.
+
+    Args:
+        expr: The expression string to validate
+        available_columns: List of available DataFrame column names
+
+    Returns:
+        Tuple of (is_valid, error_message). If valid, error_message is empty.
+    """
+    if not expr or not isinstance(expr, str):
+        return False, "Expression is empty or not a string"
+
+    # Check for dangerous patterns
+    for pattern in DANGEROUS_EXPRESSION_PATTERNS:
+        if re.search(pattern, expr, re.IGNORECASE):
+            return False, f"Expression contains disallowed pattern: {pattern}"
+
+    # Extract identifiers from expression
+    # This matches variable-like tokens
+    identifiers = set(re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', expr))
+
+    # Check each identifier is either a column name or safe function
+    for ident in identifiers:
+        if ident in available_columns:
+            continue
+        if ident in SAFE_EXPRESSION_FUNCTIONS:
+            continue
+        # Allow pandas aggregation keywords
+        if ident in {'True', 'False', 'None', 'and', 'or', 'not', 'if', 'else'}:
+            continue
+        # Allow numpy-style type names in expressions
+        if ident in {'float', 'int', 'nan', 'inf'}:
+            continue
+        return False, f"Unknown identifier '{ident}' - must be a column name or safe function"
+
+    return True, ""
+
+from data_model import AnnotationSegment, DataModel, OperationRecord
 from dialogs import (
     AnnotationTable,
     ExportCSVDialog,
@@ -50,6 +120,7 @@ from dialogs import (
     ShortcutDialog,
     CompareTrialsDialog,
     CalibrationWizard,
+    RelativeOrientationDialog,
 )
 from filter_engine import FilterEngine
 from plot2d import PlotController2D
@@ -407,7 +478,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.setInterval(40)
         self.autosave_timer = QtCore.QTimer(self)
-        self.autosave_timer.setInterval(120000)
+        self.autosave_timer.setInterval(30000)  # 30 seconds - reduced from 120s for less data loss risk
         self.play_speed = 1.0
         self.current_time = 0.0
         self.snap_to_index = True
@@ -581,6 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tools_menu.addAction("Coordinate frames…", self.on_frames)
         self.tools_menu.addAction("3D mapping…", self.on_mapping)
         self.tools_menu.addAction("Derived frame transform…", self.on_frame_transform)
+        self.tools_menu.addAction("Relative orientation…", self.on_relative_orientation)
         self.tools_menu.addAction("Calibration wizard…", self.on_calibration)
         self.tools_menu.addAction("Save transforms…", self.on_save_transforms)
         self.tools_menu.addAction("Load transforms…", self.on_load_transforms)
@@ -590,6 +662,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tools_menu.addAction("Compare trials…", self.on_compare_trials)
         self.tools_menu.addAction("Guided wizard…", self.on_wizard)
         self._build_plugin_menu()
+        self._build_3d_view_menu(menubar)
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction("Shortcuts", self.on_shortcuts)
         help_menu.addAction("About", lambda: QtWidgets.QMessageBox.information(self, "About", "Time-Series Annotation Studio"))
@@ -611,6 +684,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plugins.load_plugins()
         self._build_plugin_menu()
         self.statusBar().showMessage("Plugins reloaded")
+
+    def _build_3d_view_menu(self, menubar: QtWidgets.QMenuBar) -> None:
+        """Build the 3D View menu with camera presets and zoom controls."""
+        self.view_3d_menu = menubar.addMenu("3D &View")
+
+        # View presets
+        self.view_3d_menu.addAction("Reset View", lambda: self.plot3d.set_view_preset("reset"))
+        self.view_3d_menu.addSeparator()
+        self.view_3d_menu.addAction("Top View", lambda: self.plot3d.set_view_preset("top"))
+        self.view_3d_menu.addAction("Front View", lambda: self.plot3d.set_view_preset("front"))
+        self.view_3d_menu.addAction("Back View", lambda: self.plot3d.set_view_preset("back"))
+        self.view_3d_menu.addAction("Side View (Right)", lambda: self.plot3d.set_view_preset("side"))
+        self.view_3d_menu.addAction("Side View (Left)", lambda: self.plot3d.set_view_preset("left"))
+        self.view_3d_menu.addAction("Isometric View", lambda: self.plot3d.set_view_preset("isometric"))
+
+        # Zoom controls
+        self.view_3d_menu.addSeparator()
+        zoom_in_action = self.view_3d_menu.addAction("Zoom In", self.plot3d.zoom_in)
+        zoom_in_action.setShortcut(QtGui.QKeySequence("Ctrl+="))
+        zoom_out_action = self.view_3d_menu.addAction("Zoom Out", self.plot3d.zoom_out)
+        zoom_out_action.setShortcut(QtGui.QKeySequence("Ctrl+-"))
 
     def _connect_signals(self) -> None:
         self.channel_manager.channelToggled.connect(self.update_channels)
@@ -812,10 +906,113 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_model.apply_dataframe(df, "frame_transform", 0.0, df["normalized_time"].max(), {"source": src, "target": dst, "offset": offset})
         self._run_suggestions()
 
+    def on_relative_orientation(self) -> None:
+        """Open the relative orientation dialog to compute relative angles between segments."""
+        if self.data_model.df is None or not self.data_model.signal_columns:
+            QtWidgets.QMessageBox.information(
+                self, "No Data",
+                "Please load a CSV file first."
+            )
+            return
+
+        dlg = RelativeOrientationDialog(
+            columns=self.data_model.signal_columns,
+            df=self.data_model.df,
+            parent=self
+        )
+
+        if not dlg.exec():
+            return
+
+        params = dlg.params()
+        df = self.data_model.get_dataframe()
+
+        if params["mode"] == "heading":
+            # Simple heading mode - compute relative heading
+            src = params["source"]
+            tgt = params["target"]
+            offset = params["offset"]
+            output_name = params["output"]
+
+            if src not in df.columns or tgt not in df.columns:
+                QtWidgets.QMessageBox.warning(
+                    self, "Error",
+                    "Source or target column not found in data."
+                )
+                return
+
+            # Compute relative heading with proper wrapping
+            df[output_name] = ((df[src] - df[tgt] - offset + 180) % 360) - 180
+
+            if output_name not in self.data_model.signal_columns:
+                self.data_model.signal_columns.append(output_name)
+
+            self.data_model.apply_dataframe(
+                df, "relative_heading", 0.0, df["normalized_time"].max(),
+                {"source": src, "target": tgt, "offset": offset, "output": output_name}
+            )
+            self.statusBar().showMessage(f"Created relative heading channel: {output_name}")
+
+        else:
+            # Quaternion mode - compute relative rotation (yaw, pitch, roll)
+            parent_cols = params["parent"]
+            child_cols = params["child"]
+            outputs = params["outputs"]
+
+            # Validate columns exist
+            for col in list(parent_cols.values()) + list(child_cols.values()):
+                if col not in df.columns:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Error",
+                        f"Column '{col}' not found in data."
+                    )
+                    return
+
+            # Compute relative rotation
+            yaw, pitch, roll = self.filter_engine.relative_rotation(
+                df,
+                parent_cols["qw"], parent_cols["qx"], parent_cols["qy"], parent_cols["qz"],
+                child_cols["qw"], child_cols["qx"], child_cols["qy"], child_cols["qz"]
+            )
+
+            created_channels = []
+            if outputs["yaw"]:
+                df[outputs["yaw"]] = yaw
+                if outputs["yaw"] not in self.data_model.signal_columns:
+                    self.data_model.signal_columns.append(outputs["yaw"])
+                created_channels.append(outputs["yaw"])
+
+            if outputs["pitch"]:
+                df[outputs["pitch"]] = pitch
+                if outputs["pitch"] not in self.data_model.signal_columns:
+                    self.data_model.signal_columns.append(outputs["pitch"])
+                created_channels.append(outputs["pitch"])
+
+            if outputs["roll"]:
+                df[outputs["roll"]] = roll
+                if outputs["roll"] not in self.data_model.signal_columns:
+                    self.data_model.signal_columns.append(outputs["roll"])
+                created_channels.append(outputs["roll"])
+
+            self.data_model.apply_dataframe(
+                df, "relative_rotation", 0.0, df["normalized_time"].max(),
+                {"parent": parent_cols, "child": child_cols, "outputs": outputs}
+            )
+            self.statusBar().showMessage(f"Created relative rotation channels: {', '.join(created_channels)}")
+
+        self._run_suggestions()
+
     def on_calibration(self) -> None:
         if self.data_model.df is None:
             return
-        dlg = CalibrationWizard(self.data_model.signal_columns, self)
+        # Get current selection from 2D plot (if any)
+        selection = self.plot2d.get_selection()
+        dlg = CalibrationWizard(
+            self.data_model.signal_columns,
+            df=self.data_model.df,
+            current_selection=selection,
+            parent=self
+        )
         if not dlg.exec():
             return
         params = dlg.params()
@@ -837,6 +1034,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.data_model.df is None:
             return
         dlg = MappingDialog(list(self.data_model.df.columns), self)
+        # Restore existing mapping if available
+        if self.mapping:
+            dlg.set_mapping(self.mapping)
         if dlg.exec():
             self.mapping = dlg.mapping()
             if self.mapping:
@@ -1058,6 +1258,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filter_engine.set_sample_rate(model.sample_rate)
             df = model.get_dataframe()
             op_count = 0
+            skipped_ops: List[str] = []  # Track skipped operations
+
             for op in recipe.get("operations", []):
                 desc = op.get("description")
                 params = op.get("params", {})
@@ -1067,46 +1269,86 @@ class MainWindow(QtWidgets.QMainWindow):
                     # Validate channels exist in the DataFrame
                     missing = [c for c in chans if c not in df.columns]
                     if missing:
-                        QtWidgets.QMessageBox.warning(
-                            self, "Recipe Warning",
-                            f"Channels not found in {os.path.basename(trial_path) if trial_path != '__current__' else 'current session'}:\n"
-                            f"{', '.join(missing)}\n\n"
-                            f"Skipping filter operation."
-                        )
+                        filter_type = params.get("filter_type", params.get("filter", "unknown"))
+                        skipped_ops.append(f"filter ({filter_type}): missing channels {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}")
                         continue
 
                     f_params = {k: v for k, v in params.items() if k != "channels"}
-                    df = self.filter_engine.apply(df, chans, f_params.get("filter_type", params.get("filter", "moving_average")), f_params)
-                    op_count += 1
+                    try:
+                        df = self.filter_engine.apply(df, chans, f_params.get("filter_type", params.get("filter", "moving_average")), f_params)
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"filter: {type(e).__name__} - {str(e)[:50]}")
+
                 elif desc and desc.startswith("plugin:"):
                     plugin_name = desc.split(":", 1)[1]
-                    self.apply_plugin(plugin_name)
-                    op_count += 1
+                    # Use _apply_plugin_to_df to apply to batch DataFrame, not self.data_model
+                    try:
+                        df, new_cols = self._apply_plugin_to_df(
+                            plugin_name, df, model.signal_columns, show_warnings=False  # Don't show per-op warnings
+                        )
+                        # Track new columns for this model
+                        for col in new_cols:
+                            if col not in model.signal_columns:
+                                model.signal_columns.append(col)
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"plugin ({plugin_name}): {type(e).__name__}")
+
+            trial_name = os.path.basename(trial_path) if trial_path != "__current__" else "current session"
             if trial_path == "__current__":
                 model.apply_dataframe(df, "recipe", 0.0, df["normalized_time"].max(), {"recipe": os.path.basename(path)})
-                summaries.append(f"Current session: {op_count} ops")
+                summary = f"Current session: {op_count} ops applied"
             else:
                 model.set_dataframe(df)
                 out_path = os.path.splitext(trial_path)[0] + "_recipe.csv"
                 model.save_clean(out_path)
-                summaries.append(f"{os.path.basename(trial_path)} -> {os.path.basename(out_path)} ({op_count} ops)")
+                summary = f"{trial_name} -> {os.path.basename(out_path)} ({op_count} ops)"
                 self.project.update_status(trial_path, "cleaned", f"Recipe applied ({op_count} ops)")
+
+            # Add skipped operations to summary
+            if skipped_ops:
+                summary += f", {len(skipped_ops)} skipped"
+            summaries.append(summary)
+
+            # Collect all skipped operations for warning
+            if skipped_ops:
+                for skip_msg in skipped_ops[:5]:  # Limit to first 5
+                    summaries.append(f"  ⚠ {skip_msg}")
         if summaries:
             QtWidgets.QMessageBox.information(self, "Batch recipe summary", "\n".join(summaries))
         self.project_panel.refresh()
         self.statusBar().showMessage("Recipe applied")
 
-    def apply_plugin(self, name: str) -> None:
+    def _apply_plugin_to_df(
+        self,
+        name: str,
+        df: pd.DataFrame,
+        signal_columns: List[str],
+        show_warnings: bool = True
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Apply plugin operations to a DataFrame (for batch processing).
+
+        Args:
+            name: Plugin name
+            df: DataFrame to modify
+            signal_columns: List of signal column names
+            show_warnings: Whether to show warning dialogs
+
+        Returns:
+            Tuple of (modified DataFrame, new signal columns added)
+        """
         plugin = self.plugins.get_plugin(name)
-        if not plugin or self.data_model.df is None:
-            return
-        self.filter_engine.set_sample_rate(self.data_model.sample_rate)
-        df = self.data_model.get_dataframe()
+        if not plugin:
+            return df, []
+
+        new_columns: List[str] = []
         ops = plugin.get("operations", [plugin])
+
         for op in ops:
             op_type = op.get("type", "")
             if op_type == "filter":
-                channels = op.get("channels", self.data_model.signal_columns)
+                channels = op.get("channels", signal_columns)
                 ftype = op.get("filter", "moving_average")
                 params = op.get("params", {})
                 df = self.filter_engine.apply(df, channels, ftype, params)
@@ -1114,12 +1356,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 expr = op.get("expr")
                 out = op.get("name", "derived")
                 if expr:
+                    # Security: Validate expression before execution
+                    is_valid, error_msg = validate_plugin_expression(expr, list(df.columns))
+                    if not is_valid:
+                        if show_warnings:
+                            QtWidgets.QMessageBox.warning(
+                                self, "Plugin Security Error",
+                                f"Expression blocked for security reasons:\n\n"
+                                f"Expression: {expr[:100]}{'...' if len(expr) > 100 else ''}\n\n"
+                                f"Reason: {error_msg}"
+                            )
+                        continue
+
                     try:
                         df[out] = pd.eval(expr, local_dict=df.to_dict("series"))
-                        if out not in self.data_model.signal_columns:
-                            self.data_model.signal_columns.append(out)
+                        if out not in signal_columns:
+                            new_columns.append(out)
                     except Exception as exc:
-                        QtWidgets.QMessageBox.warning(self, "Plugin error", str(exc))
+                        if show_warnings:
+                            QtWidgets.QMessageBox.warning(self, "Plugin error", str(exc))
+
+        return df, new_columns
+
+    def apply_plugin(self, name: str) -> None:
+        """Apply plugin to the current data model."""
+        if self.data_model.df is None:
+            return
+        self.filter_engine.set_sample_rate(self.data_model.sample_rate)
+        df = self.data_model.get_dataframe()
+
+        df, new_columns = self._apply_plugin_to_df(
+            name, df, self.data_model.signal_columns, show_warnings=True
+        )
+
+        # Add any new columns to signal_columns
+        for col in new_columns:
+            if col not in self.data_model.signal_columns:
+                self.data_model.signal_columns.append(col)
+
         self.data_model.apply_dataframe(df, f"plugin:{name}", 0.0, df["normalized_time"].max(), {"plugin": name})
 
     def on_compare_trials(self) -> None:
@@ -1655,69 +1929,25 @@ class MainWindow(QtWidgets.QMainWindow):
         ann_id = self.ann_table.selected_annotation_id()
         if ann_id == -1:
             return
-
-        # Find annotation for confirmation message
-        ann = next((a for a in self.data_model.annotations if a.id == ann_id), None)
-        if ann is None:
-            return
-
-        reply = QtWidgets.QMessageBox.question(
-            self,
-            "Confirm Deletion",
-            f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
-        )
-
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
-
         self.data_model.delete_annotation(ann_id)
+        self.statusBar().showMessage("Annotation deleted (Ctrl+Z to undo)")
 
     def delete_selected_annotation(self) -> None:
         """Delete the currently selected annotation via keyboard (Delete/Backspace)."""
         # Check if we have a plot-selected annotation first
         if self.selected_annotation_id is not None:
-            ann = next((a for a in self.data_model.annotations if a.id == self.selected_annotation_id), None)
-            if ann is None:
-                return
-
-            reply = QtWidgets.QMessageBox.question(
-                self,
-                "Confirm Deletion",
-                f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
-            )
-            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
-
             self.data_model.delete_annotation(self.selected_annotation_id)
             self.selected_annotation_id = None
             self._on_annotations_changed()
-            self.statusBar().showMessage("Annotation deleted")
+            self.statusBar().showMessage("Annotation deleted (Ctrl+Z to undo)")
             return
 
         # Fall back to table selection
         ann_id = self.ann_table.selected_annotation_id()
         if ann_id != -1:
-            ann = next((a for a in self.data_model.annotations if a.id == ann_id), None)
-            if ann is None:
-                return
-
-            reply = QtWidgets.QMessageBox.question(
-                self,
-                "Confirm Deletion",
-                f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
-            )
-            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
-
             self.data_model.delete_annotation(ann_id)
             self._on_annotations_changed()
-            self.statusBar().showMessage("Annotation deleted")
+            self.statusBar().showMessage("Annotation deleted (Ctrl+Z to undo)")
 
     def _on_snap_changed(self) -> None:
         self.snap_to_index = self.snap_index_chk.isChecked()
@@ -1810,12 +2040,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def autosave(self) -> None:
         try:
             state = {
+                "schema_version": 2,  # Version 2 includes history and sample_rate
                 "data": self.data_model.get_dataframe().to_dict(orient="list") if self.data_model.df is not None else None,
                 "annotations": [ann.__dict__ for ann in self.data_model.annotations],
                 "deletions": self.data_model.deletions,
+                "history": [rec.__dict__ for rec in self.data_model.history],
+                "sample_rate": self.data_model.sample_rate,
             }
-            with open(self.autosave_path, "w", encoding="utf-8") as f:
-                json.dump(state, f)
+
+            # Atomic write: write to temp file, then rename
+            autosave_dir = os.path.dirname(self.autosave_path) or "."
+            fd, temp_path = tempfile.mkstemp(suffix=".json", dir=autosave_dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                # Atomic rename (works on same filesystem)
+                shutil.move(temp_path, self.autosave_path)
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+
         except PermissionError:
             self.statusBar().showMessage("Autosave failed: Permission denied", 5000)
         except OSError as e:
@@ -1842,15 +2090,52 @@ class MainWindow(QtWidgets.QMainWindow):
             if data_dict:
                 df = pd.DataFrame(data_dict)
                 self.data_model.set_dataframe(df)
-                self.data_model.annotations = [AnnotationSegment(**a) for a in state.get("annotations", [])]
+
+                # Restore annotations (robust deserialization)
+                restored_annotations = []
+                for a in state.get("annotations", []):
+                    try:
+                        restored_annotations.append(AnnotationSegment(**a))
+                    except (TypeError, ValueError) as e:
+                        print(f"Skipping malformed annotation: {e}")
+                        continue
+                self.data_model.annotations = restored_annotations
+
                 self.data_model.deletions = [tuple(d) for d in state.get("deletions", [])]
+
+                # Restore history (new in schema v2)
+                restored_history = []
+                for h in state.get("history", []):
+                    try:
+                        restored_history.append(OperationRecord(**h))
+                    except (TypeError, ValueError) as e:
+                        print(f"Skipping malformed history record: {e}")
+                        continue
+                self.data_model.history = restored_history
+
+                # Restore sample rate (new in schema v2)
+                if "sample_rate" in state:
+                    try:
+                        self.data_model.sample_rate = float(state["sample_rate"])
+                    except (TypeError, ValueError):
+                        pass
+
                 groups = self.data_model.channel_groups()
                 self.channel_manager.populate(self.data_model.time_columns, self.data_model.metadata_columns, groups)
                 self.update_channels()
                 self._on_annotations_changed()
+                self.data_model.historyChanged.emit()
                 self.statusBar().showMessage("Restored autosave session")
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "Restore failed", "Could not restore autosave.")
+        except json.JSONDecodeError as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Restore failed",
+                f"Autosave file is corrupted:\n{e.msg} at line {e.lineno}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Restore failed",
+                f"Could not restore autosave:\n{type(e).__name__}: {e}"
+            )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self.autosave()

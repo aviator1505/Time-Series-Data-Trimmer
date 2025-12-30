@@ -101,12 +101,18 @@ class PlotController2D:
         # Detach transient items from existing plots to avoid cross-scene removal warnings
         sel_region_vals = None
         cursor_pos = None
-        if self.selection_region:
+
+        # Block signals on the selection region before starting refresh to prevent
+        # race conditions where callbacks fire on stale/destroyed plot references
+        old_region = self.selection_region
+        if old_region is not None:
             try:
-                sel_region_vals = self.selection_region.getRegion()
+                old_region.blockSignals(True)
+                sel_region_vals = old_region.getRegion()
             except Exception:
                 sel_region_vals = None
             self.selection_region = None  # recreate per scene
+
         if self.time_cursor:
             try:
                 cursor_pos = self.time_cursor.value()
@@ -180,6 +186,13 @@ class PlotController2D:
                 except Exception:
                     pass
         self.selection_region = None
+
+    def get_selection(self) -> Tuple[float, float] | None:
+        """Return current selection as (start, end) tuple, or None if no selection."""
+        if self.selection_region is not None:
+            start, end = self.selection_region.getRegion()
+            return (start, end)
+        return None
 
     def set_time_cursor(self, t: float) -> None:
         if self.time_cursor is not None:
@@ -620,7 +633,9 @@ class PlotController2D:
                 name=name,
             )
         else:  # line
-            plot.plot(time, values, pen=pg.mkPen(color=color, width=1.2), name=name)
+            # Note: stepMode=False required to work around pyqtgraph 0.14.0 bug
+            # where avgToggled() crashes with KeyError: 'stepMode'
+            plot.plot(time, values, pen=pg.mkPen(color=color, width=1.2), name=name, stepMode=False)
 
     def _draw_seasonal(self, time: np.ndarray) -> None:
         base = time - float(time.min())

@@ -5,8 +5,13 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass, asdict, fields
 from typing import Dict, List, Optional
+
+# Schema version for project files - increment when format changes
+PROJECT_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -117,12 +122,44 @@ class ProjectManager:
         if not self.project_path:
             return
         data = {
+            "schema_version": PROJECT_SCHEMA_VERSION,
             "trials": [asdict(t) for t in self.trials],
             "recipes": [asdict(r) for r in self.recipes],
             "preferences": self.preferences,
         }
-        with open(self.project_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+
+        # Atomic write: write to temp file, then rename
+        project_dir = os.path.dirname(self.project_path) or "."
+        fd, temp_path = tempfile.mkstemp(suffix=".json", dir=project_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            # Atomic rename (works on same filesystem)
+            shutil.move(temp_path, self.project_path)
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    def _migrate_schema(self, data: Dict, from_version: int) -> Dict:
+        """Migrate data from older schema versions.
+
+        Args:
+            data: Project data dictionary
+            from_version: Source schema version
+
+        Returns:
+            Migrated data dictionary
+        """
+        # Currently at version 1, no migrations needed yet
+        # Future migrations would be added here:
+        # if from_version < 2:
+        #     # Migrate from v1 to v2
+        #     data = self._migrate_v1_to_v2(data)
+        return data
 
     def load(self, path: str) -> None:
         if not os.path.isfile(path):
@@ -131,21 +168,34 @@ class ProjectManager:
             data = json.load(f)
         self.project_path = path
 
+        # Check schema version and migrate if needed
+        schema_version = data.get("schema_version", 0)
+        if schema_version < PROJECT_SCHEMA_VERSION:
+            data = self._migrate_schema(data, schema_version)
+
         # Safely load trials with unknown field tolerance
         trials_data = data.get("trials", [])
         self.trials = []
         known_trial_fields = {f.name for f in fields(TrialEntry)}
         for t in trials_data:
-            filtered = {k: v for k, v in t.items() if k in known_trial_fields}
-            self.trials.append(TrialEntry(**filtered))
+            try:
+                filtered = {k: v for k, v in t.items() if k in known_trial_fields}
+                self.trials.append(TrialEntry(**filtered))
+            except (TypeError, ValueError):
+                # Skip malformed trial entries
+                continue
 
         # Same for recipes
         recipes_data = data.get("recipes", [])
         self.recipes = []
         known_recipe_fields = {f.name for f in fields(Recipe)}
         for r in recipes_data:
-            filtered = {k: v for k, v in r.items() if k in known_recipe_fields}
-            self.recipes.append(Recipe(**filtered))
+            try:
+                filtered = {k: v for k, v in r.items() if k in known_recipe_fields}
+                self.recipes.append(Recipe(**filtered))
+            except (TypeError, ValueError):
+                # Skip malformed recipe entries
+                continue
 
         # Merge preferences to preserve new defaults
         self.preferences = {**self.preferences, **data.get("preferences", {})}
@@ -189,10 +239,23 @@ def load_signal_presets() -> Dict[str, Dict]:
 
 
 def save_signal_presets(presets: Dict[str, Dict]) -> None:
-    """Save signal presets to disk."""
+    """Save signal presets to disk with atomic write."""
     try:
-        with open(SIGNAL_PRESETS_FILE, "w", encoding="utf-8") as f:
-            json.dump(presets, f, indent=2)
+        preset_dir = SIGNAL_PRESETS_FILE.parent
+        preset_dir.mkdir(parents=True, exist_ok=True)
+
+        # Atomic write: write to temp file, then rename
+        fd, temp_path = tempfile.mkstemp(suffix=".json", dir=str(preset_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(presets, f, indent=2)
+            shutil.move(temp_path, str(SIGNAL_PRESETS_FILE))
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         print(f"Failed to save presets: {e}")
 

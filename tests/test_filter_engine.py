@@ -221,3 +221,177 @@ def test_savgol_handles_small_data():
 
     assert len(result) == 3
     assert not np.any(np.isnan(result))
+
+
+# ---------------------- Joint/Relative Angle Tests ----------------------
+
+def test_relative_heading_wraps_correctly():
+    """Relative heading should wrap to [-180, 180] range."""
+    df = pd.DataFrame({
+        "normalized_time": [0, 1, 2, 3, 4],
+        "source": [10.0, 350.0, 180.0, 90.0, 270.0],
+        "target": [0.0, 10.0, 0.0, 180.0, 90.0],
+    })
+    engine = FilterEngine()
+
+    result = engine.relative_heading(df, "source", "target", offset=0.0)
+
+    # 10 - 0 = 10
+    # 350 - 10 = 340 -> wraps to -20
+    # 180 - 0 = 180 -> wraps to -180 (boundary case)
+    # 90 - 180 = -90
+    # 270 - 90 = 180 -> wraps to -180 (boundary case)
+    # Note: 180 and -180 are equivalent for angles, the formula wraps to -180
+    expected = np.array([10.0, -20.0, -180.0, -90.0, -180.0])
+    assert np.allclose(result, expected, atol=1e-10)
+
+
+def test_relative_heading_with_offset():
+    """Relative heading should apply offset before wrapping."""
+    df = pd.DataFrame({
+        "normalized_time": [0, 1],
+        "source": [100.0, 200.0],
+        "target": [0.0, 0.0],
+    })
+    engine = FilterEngine()
+
+    # Without offset: 100 - 0 = 100, 200 - 0 = 200 -> wraps to -160
+    result_no_offset = engine.relative_heading(df, "source", "target", offset=0.0)
+    assert np.allclose(result_no_offset, [100.0, -160.0], atol=1e-10)
+
+    # With offset of 50: 100 - 0 - 50 = 50, 200 - 0 - 50 = 150
+    result_with_offset = engine.relative_heading(df, "source", "target", offset=50.0)
+    assert np.allclose(result_with_offset, [50.0, 150.0], atol=1e-10)
+
+
+def test_quaternion_to_euler_identity():
+    """Identity quaternion (1,0,0,0) should give zero Euler angles."""
+    df = pd.DataFrame({
+        "qw": [1.0, 1.0],
+        "qx": [0.0, 0.0],
+        "qy": [0.0, 0.0],
+        "qz": [0.0, 0.0],
+    })
+    engine = FilterEngine()
+
+    yaw, pitch, roll = engine.quaternion_to_euler(df, "qw", "qx", "qy", "qz")
+
+    assert np.allclose(yaw, 0.0, atol=1e-10)
+    assert np.allclose(pitch, 0.0, atol=1e-10)
+    assert np.allclose(roll, 0.0, atol=1e-10)
+
+
+def test_quaternion_to_euler_pure_yaw():
+    """A 90-degree yaw rotation quaternion should give yaw=90, pitch=0, roll=0."""
+    # 90 degrees around Z-axis: q = (cos(45), 0, 0, sin(45))
+    angle = np.radians(90)
+    qw = np.cos(angle / 2)
+    qz = np.sin(angle / 2)
+
+    df = pd.DataFrame({
+        "qw": [qw],
+        "qx": [0.0],
+        "qy": [0.0],
+        "qz": [qz],
+    })
+    engine = FilterEngine()
+
+    yaw, pitch, roll = engine.quaternion_to_euler(df, "qw", "qx", "qy", "qz")
+
+    assert np.allclose(yaw, 90.0, atol=1e-6)
+    assert np.allclose(pitch, 0.0, atol=1e-6)
+    assert np.allclose(roll, 0.0, atol=1e-6)
+
+
+def test_relative_rotation_identity():
+    """Same quaternion for parent and child should give zero relative rotation."""
+    # Arbitrary non-identity quaternion (30 deg around Z)
+    angle = np.radians(30)
+    qw = np.cos(angle / 2)
+    qz = np.sin(angle / 2)
+
+    df = pd.DataFrame({
+        "p_qw": [qw, 1.0],
+        "p_qx": [0.0, 0.0],
+        "p_qy": [0.0, 0.0],
+        "p_qz": [qz, 0.0],
+        "c_qw": [qw, 1.0],
+        "c_qx": [0.0, 0.0],
+        "c_qy": [0.0, 0.0],
+        "c_qz": [qz, 0.0],
+    })
+    engine = FilterEngine()
+
+    yaw, pitch, roll = engine.relative_rotation(
+        df,
+        "p_qw", "p_qx", "p_qy", "p_qz",
+        "c_qw", "c_qx", "c_qy", "c_qz"
+    )
+
+    # Same quaternions should give identity relative rotation
+    assert np.allclose(yaw, 0.0, atol=1e-6)
+    assert np.allclose(pitch, 0.0, atol=1e-6)
+    assert np.allclose(roll, 0.0, atol=1e-6)
+
+
+def test_relative_rotation_computes_difference():
+    """Relative rotation should compute child rotation relative to parent."""
+    # Parent: identity
+    # Child: 45 deg yaw
+    angle = np.radians(45)
+    c_qw = np.cos(angle / 2)
+    c_qz = np.sin(angle / 2)
+
+    df = pd.DataFrame({
+        "p_qw": [1.0],
+        "p_qx": [0.0],
+        "p_qy": [0.0],
+        "p_qz": [0.0],
+        "c_qw": [c_qw],
+        "c_qx": [0.0],
+        "c_qy": [0.0],
+        "c_qz": [c_qz],
+    })
+    engine = FilterEngine()
+
+    yaw, pitch, roll = engine.relative_rotation(
+        df,
+        "p_qw", "p_qx", "p_qy", "p_qz",
+        "c_qw", "c_qx", "c_qy", "c_qz"
+    )
+
+    # child relative to identity = child's own rotation = 45 deg yaw
+    assert np.allclose(yaw, 45.0, atol=1e-6)
+    assert np.allclose(pitch, 0.0, atol=1e-6)
+    assert np.allclose(roll, 0.0, atol=1e-6)
+
+
+def test_vector_magnitude_2d():
+    """Vector magnitude should compute correct 2D magnitude."""
+    df = pd.DataFrame({
+        "x": [3.0, 0.0, 1.0],
+        "y": [4.0, 5.0, 1.0],
+    })
+    engine = FilterEngine()
+
+    result = engine.vector_magnitude(df, "x", "y")
+
+    # sqrt(3^2 + 4^2) = 5, sqrt(0 + 25) = 5, sqrt(1 + 1) = sqrt(2)
+    expected = np.array([5.0, 5.0, np.sqrt(2)])
+    assert np.allclose(result, expected, atol=1e-10)
+
+
+def test_vector_magnitude_3d():
+    """Vector magnitude should compute correct 3D magnitude."""
+    df = pd.DataFrame({
+        "x": [1.0, 0.0],
+        "y": [2.0, 0.0],
+        "z": [2.0, 5.0],
+    })
+    engine = FilterEngine()
+
+    result = engine.vector_magnitude(df, "x", "y", "z")
+
+    # sqrt(1 + 4 + 4) = 3, sqrt(0 + 0 + 25) = 5
+    expected = np.array([3.0, 5.0])
+    assert np.allclose(result, expected, atol=1e-10)

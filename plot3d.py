@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Iterable
+from typing import Dict, List, Optional, Iterable
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,21 @@ class PlotController3D:
         self.trails: Dict[str, gl.GLLinePlotItem] = {}
         self.trail_history: Dict[str, list[np.ndarray]] = {}
         self.trail_length = 60  # frames to keep in trail
+        # Track parts using fallback positions for visual indication (Issue 2 fix)
+        self.fallback_parts: set = set()
+        # Status callback for reporting fallback usage (optional)
+        self.status_callback: Optional[callable] = None
+        # World and user-defined frame axes visualization
+        self.world_axes: Dict[str, gl.GLLinePlotItem] = {}
+        self.world_axis_labels: List[gl.GLTextItem] = []
+        self.world_label: Optional[gl.GLTextItem] = None
+        self.show_world_axes: bool = True  # Toggle for world axes visibility
+        self.frame_axes: Dict[str, Dict[str, gl.GLLinePlotItem]] = {}
+        self.frame_labels: Dict[str, gl.GLTextItem] = {}
+        self.frame_highlight: List[gl.GLLinePlotItem] = []  # Highlighted frame axes
+        self.highlighted_frame: Optional[str] = None
+        self.show_frame_axes: bool = True  # Toggle for frame axes visibility
+        self._draw_world_axes()
 
     def set_data(self, df: pd.DataFrame) -> None:
         self.data = df.copy()
@@ -59,6 +74,8 @@ class PlotController3D:
         used_labels = set()
         used_axes = set()
         pos_dict: Dict[str, np.ndarray] = {}
+        # Clear fallback tracking for this frame (Issue 2 fix)
+        self.fallback_parts.clear()
         # try to build from mappings, else derive automatically from column names
         target_parts = list(self.mappings.keys()) if self.mappings else [
             "head",
@@ -74,11 +91,21 @@ class PlotController3D:
             if pos is None:
                 continue
             points.append(pos.tolist())
-            colors.append((0.3, 0.3, 0.8, 1.0))
+            # Issue 2 fix: Use orange/yellow color for fallback positions to indicate data issue
+            if has_translation:
+                colors.append((0.3, 0.3, 0.8, 1.0))  # Normal blue color
+            else:
+                colors.append((1.0, 0.6, 0.1, 1.0))  # Orange color for fallback
+                self.fallback_parts.add(part)
             self._draw_axes(part, pos, rot)
             used_axes.add(part)
             heading = self._heading_from_rotation(part, rot, row)
-            self._draw_arrow(part, *pos, heading, long_arrow=not has_translation)
+            # Issue 3 fix: Only draw arrow if heading is valid (not None/NaN)
+            if heading is not None and not (isinstance(heading, float) and np.isnan(heading)):
+                self._draw_arrow(part, *pos, heading, long_arrow=not has_translation)
+            else:
+                # Clean up existing arrow when heading becomes unavailable
+                self._remove_arrow(part)
             self._place_label(part, *pos)
             used_labels.add(part)
             pos_dict[part] = pos
@@ -122,14 +149,304 @@ class PlotController3D:
         self._update_skeleton(pos_dict)
         self._update_trails(pos_dict)
 
-    def _heading_from_rotation(self, part: str, rot: np.ndarray, row: pd.Series) -> float:
-        """Derive heading from rotation matrix or fallbacks."""
+        # Draw coordinate frame axes at body part positions
+        self._update_frame_axes(pos_dict)
+
+        # Issue 2 fix: Emit status message when parts are using fallback positions
+        if self.fallback_parts and self.status_callback:
+            parts_list = ", ".join(sorted(self.fallback_parts))
+            self.status_callback(f"3D fallback positions for: {parts_list}")
+
+    def set_status_callback(self, callback: callable) -> None:
+        """Set callback for status messages (e.g., fallback position warnings)."""
+        self.status_callback = callback
+
+    # ------------------------------------------------------------------
+    # Coordinate Frame Visualization
+    # ------------------------------------------------------------------
+    def _draw_world_axes(self) -> None:
+        """Draw RGB axes at origin showing world coordinate frame.
+
+        Convention: Red=X (forward), Green=Y (left), Blue=Z (up)
+        This helps users understand the coordinate system.
+        """
+        axis_length = 1.0
+        axis_width = 3
+
+        # X axis - Red
+        x_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [axis_length, 0, 0]], dtype=float),
+            color=(1, 0, 0, 1),
+            width=axis_width,
+            antialias=True
+        )
+        self.view.addItem(x_axis)
+        self.world_axes["X"] = x_axis
+
+        # Y axis - Green
+        y_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, axis_length, 0]], dtype=float),
+            color=(0, 1, 0, 1),
+            width=axis_width,
+            antialias=True
+        )
+        self.view.addItem(y_axis)
+        self.world_axes["Y"] = y_axis
+
+        # Z axis - Blue
+        z_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, 0, axis_length]], dtype=float),
+            color=(0, 0, 1, 1),
+            width=axis_width,
+            antialias=True
+        )
+        self.view.addItem(z_axis)
+        self.world_axes["Z"] = z_axis
+
+        # Add X/Y/Z labels at axis tips
+        self._add_axis_label("X", axis_length + 0.1, 0, 0, (255, 100, 100))
+        self._add_axis_label("Y", 0, axis_length + 0.1, 0, (100, 255, 100))
+        self._add_axis_label("Z", 0, 0, axis_length + 0.1, (100, 100, 255))
+
+    def _add_axis_label(self, text: str, x: float, y: float, z: float,
+                        color: tuple) -> None:
+        """Add a text label for an axis at the specified position.
+
+        Args:
+            text: Label text (e.g., "X", "Y", "Z").
+            x: X coordinate for label position.
+            y: Y coordinate for label position.
+            z: Z coordinate for label position.
+            color: RGB tuple (0-255) for label color.
+        """
+        try:
+            label = gl.GLTextItem(
+                text=text,
+                pos=np.array([x, y, z], dtype=float),
+                color=QtGui.QColor(*color),
+                font=QtGui.QFont("Helvetica", 10),
+            )
+            self.world_axis_labels.append(label)
+            self.view.addItem(label)
+        except Exception:
+            # GLTextItem may not be available in all pyqtgraph versions
+            pass
+
+    def set_world_axes_visible(self, visible: bool) -> None:
+        """Show or hide the world coordinate frame axes.
+
+        Args:
+            visible: True to show world axes, False to hide them.
+        """
+        self.show_world_axes = visible
+
+        # Toggle visibility of axis lines
+        for axis in self.world_axes.values():
+            try:
+                axis.setVisible(visible)
+            except Exception:
+                pass
+
+        # Toggle visibility of axis labels
+        for label in self.world_axis_labels:
+            try:
+                label.setVisible(visible)
+            except Exception:
+                pass
+
+    def draw_frame_at_position(self, frame_name: str, position: np.ndarray, heading_offset: float) -> None:
+        """Draw coordinate frame axes at a specific position with heading rotation.
+
+        Args:
+            frame_name: Name of the frame (for labeling and tracking).
+            position: (x, y, z) position to draw the frame.
+            heading_offset: Total heading offset in degrees (from hierarchical computation).
+        """
+        if not self.show_frame_axes:
+            return
+
+        # Remove existing frame axes if present
+        if frame_name in self.frame_axes:
+            for axis_line in self.frame_axes[frame_name].values():
+                try:
+                    self.view.removeItem(axis_line)
+                except Exception:
+                    pass
+
+        # Remove existing label if present
+        if frame_name in self.frame_labels:
+            try:
+                self.view.removeItem(self.frame_labels[frame_name])
+            except Exception:
+                pass
+
+        axis_length = 0.3
+        angle_rad = math.radians(heading_offset)
+
+        # Rotate X and Y axes by heading offset (Z stays vertical)
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+
+        # Local X axis (forward direction after rotation)
+        x_dir = np.array([cos_a, sin_a, 0])
+        # Local Y axis (left direction after rotation)
+        y_dir = np.array([-sin_a, cos_a, 0])
+        # Z axis stays up
+        z_dir = np.array([0, 0, 1])
+
+        # Use brighter colors for highlighted frame
+        is_highlighted = (frame_name == self.highlighted_frame)
+        if is_highlighted:
+            axes_config = [
+                ("X", x_dir, (1.0, 0.5, 0.5, 1.0), 3),  # Bright red, thicker
+                ("Y", y_dir, (0.5, 1.0, 0.5, 1.0), 3),  # Bright green, thicker
+                ("Z", z_dir, (0.5, 0.5, 1.0, 1.0), 3),  # Bright blue, thicker
+            ]
+        else:
+            axes_config = [
+                ("X", x_dir, (1.0, 0.4, 0.4, 0.8), 2),  # Light red
+                ("Y", y_dir, (0.4, 1.0, 0.4, 0.8), 2),  # Light green
+                ("Z", z_dir, (0.4, 0.4, 1.0, 0.8), 2),  # Light blue
+            ]
+
+        self.frame_axes[frame_name] = {}
+        for axis_name, direction, color, width in axes_config:
+            end = position + direction * axis_length
+            line_pts = np.vstack([position, end])
+            line = gl.GLLinePlotItem(pos=line_pts, color=np.array(color), width=width, antialias=True)
+            self.frame_axes[frame_name][axis_name] = line
+            self.view.addItem(line)
+
+        # Add frame label slightly offset
+        try:
+            label_color = QtGui.QColor(255, 255, 200) if is_highlighted else QtGui.QColor(200, 200, 200)
+            font_size = 10 if is_highlighted else 8
+            label = gl.GLTextItem(
+                text=frame_name,
+                pos=position + np.array([0, 0, axis_length + 0.05]),
+                color=label_color,
+                font=QtGui.QFont("Helvetica", font_size),
+            )
+            self.frame_labels[frame_name] = label
+            self.view.addItem(label)
+        except Exception:
+            pass
+
+    def highlight_frame(self, frame_name: Optional[str]) -> None:
+        """Highlight a specific frame's axes (thicker lines, brighter colors).
+
+        Args:
+            frame_name: Name of the frame to highlight, or None to clear highlighting.
+        """
+        self.highlighted_frame = frame_name
+        # Redraw will apply highlighting during next update_time()
+
+    def set_frame_axes_visible(self, visible: bool) -> None:
+        """Toggle visibility of all user-defined frame axes.
+
+        Args:
+            visible: True to show frame axes, False to hide them.
+        """
+        self.show_frame_axes = visible
+
+        if not visible:
+            # Remove all frame axes from view
+            self.clear_frame_axes()
+        # If visible, they will be redrawn on next update_time()
+
+    def clear_frame_axes(self) -> None:
+        """Remove all drawn user-defined frame axes."""
+        for frame_name in list(self.frame_axes.keys()):
+            for axis_line in self.frame_axes[frame_name].values():
+                try:
+                    self.view.removeItem(axis_line)
+                except Exception:
+                    pass
+        self.frame_axes.clear()
+
+        # Also remove frame labels
+        for label in self.frame_labels.values():
+            try:
+                self.view.removeItem(label)
+            except Exception:
+                pass
+        self.frame_labels.clear()
+
+    def _update_frame_axes(self, pos_dict: Dict[str, np.ndarray]) -> None:
+        """Update frame axes visualization for all defined frames.
+
+        Draws coordinate frame axes at body part positions when frame names
+        match body part names, or at origin for frames without matching parts.
+
+        Args:
+            pos_dict: Dictionary mapping part names to their 3D positions.
+        """
+        if not self.show_frame_axes or not self.frames:
+            return
+
+        # Track which frames we've drawn
+        drawn_frames = set()
+
+        for frame_name, frame_info in self.frames.items():
+            # Skip the implicit lab/world frame
+            if frame_name == "lab":
+                continue
+
+            # Find position for this frame (match to body part if possible)
+            if frame_name in pos_dict:
+                pos = pos_dict[frame_name]
+            else:
+                # Try to find a matching part name (case-insensitive)
+                pos = None
+                for part_name, part_pos in pos_dict.items():
+                    if part_name.lower() == frame_name.lower():
+                        pos = part_pos
+                        break
+
+                # No matching part - draw at origin with small z offset
+                if pos is None:
+                    idx = list(self.frames.keys()).index(frame_name)
+                    pos = np.array([0.0, 0.0, 0.1 * idx], dtype=float)
+
+            total_offset = self._frame_offset(frame_name)
+            self.draw_frame_at_position(frame_name, pos, total_offset)
+            drawn_frames.add(frame_name)
+
+        # Remove frame axes for frames that no longer exist
+        for frame_name in list(self.frame_axes.keys()):
+            if frame_name not in drawn_frames:
+                for axis_line in self.frame_axes[frame_name].values():
+                    try:
+                        self.view.removeItem(axis_line)
+                    except Exception:
+                        pass
+                del self.frame_axes[frame_name]
+
+                if frame_name in self.frame_labels:
+                    try:
+                        self.view.removeItem(self.frame_labels[frame_name])
+                    except Exception:
+                        pass
+                    del self.frame_labels[frame_name]
+
+    def _heading_from_rotation(self, part: str, rot: np.ndarray, row: pd.Series) -> Optional[float]:
+        """Derive heading from rotation matrix or fallbacks.
+
+        Issue 3 fix: Returns None when heading extraction fails instead of 0.0,
+        allowing callers to distinguish 'no data' from 'heading is 0 degrees'.
+        """
         try:
             fwd = rot[2]  # forward row
             return math.degrees(math.atan2(fwd[1], fwd[0]))
         except Exception:
             pass
-        return float(row.get(f"{part}_heading_deg", 0.0))
+        # Try to get heading from column, return None if not available
+        heading_col = f"{part}_heading_deg"
+        if heading_col in row:
+            val = row[heading_col]
+            # Check for NaN values which indicate missing data
+            if pd.notna(val):
+                return float(val)
+        return None
 
     def _draw_arrow(self, part: str, x: float, y: float, z: float, heading_deg: float, long_arrow: bool = False) -> None:
         # remove existing
@@ -147,10 +464,103 @@ class PlotController3D:
         self.arrows[part] = arrow
         self.view.addItem(arrow)
 
+    def _remove_arrow(self, part: str) -> None:
+        """Remove arrow for a part when heading is unavailable (Issue 3 fix)."""
+        if part in self.arrows:
+            try:
+                self.view.removeItem(self.arrows[part])
+            except Exception:
+                pass
+            del self.arrows[part]
+
     def _frame_offset(self, part: str) -> float:
-        # simple heading offset based on frames dict: if part frame exists, use offset
-        info = self.frames.get(part, {})
-        return float(info.get("offset", 0.0))
+        """Compute total heading offset by walking the parent chain.
+
+        This method traverses the frame hierarchy to accumulate offsets from
+        the given frame through all its ancestors up to the root (lab frame).
+
+        Args:
+            part: The frame/body part name to compute offset for.
+
+        Returns:
+            Total accumulated offset in degrees from all frames in the chain.
+        """
+        return self._get_total_offset(part, set())
+
+    def _get_total_offset(self, frame_name: str, visited: set) -> float:
+        """Recursive helper to compute total offset with cycle detection.
+
+        Args:
+            frame_name: The frame to compute offset for.
+            visited: Set of already-visited frame names to detect cycles.
+
+        Returns:
+            Accumulated offset in degrees. Returns 0.0 if frame not found
+            or if a cycle is detected.
+        """
+        # Cycle detection: if we've already visited this frame, stop recursion
+        if frame_name in visited:
+            return 0.0
+
+        # Frame not in our registry: return 0
+        if frame_name not in self.frames:
+            return 0.0
+
+        visited.add(frame_name)
+
+        info = self.frames.get(frame_name, {})
+        offset = float(info.get("offset", 0.0))
+        parent = info.get("parent", "")
+
+        # If there's a valid parent frame, recursively add its offset
+        if parent and parent in self.frames:
+            offset += self._get_total_offset(parent, visited)
+
+        return offset
+
+    def get_frame_chain(self, part: str) -> List[str]:
+        """Return list of frames from root to this part.
+
+        Useful for debugging and visualization of the kinematic chain.
+        Includes cycle detection to prevent infinite loops.
+
+        Args:
+            part: The frame/body part name to trace back to root.
+
+        Returns:
+            List of frame names from root (first) to the given part (last).
+            Empty list if part is not in frames registry.
+        """
+        chain = []
+        current = part
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            if current in self.frames:
+                chain.append(current)
+                current = self.frames[current].get("parent", "")
+            else:
+                break
+        return list(reversed(chain))
+
+    def detect_frame_cycle(self, frame_name: str) -> bool:
+        """Check if a frame is part of a cycle in the parent chain.
+
+        Args:
+            frame_name: The frame to check for cycles.
+
+        Returns:
+            True if a cycle is detected, False otherwise.
+        """
+        visited = set()
+        current = frame_name
+        while current:
+            if current in visited:
+                return True
+            visited.add(current)
+            info = self.frames.get(current, {})
+            current = info.get("parent", "")
+        return False
 
     def _anchor_position(self, idx: int, total: int) -> tuple[float, float, float]:
         """Static anchor positions when no translation data exists."""
@@ -297,7 +707,27 @@ class PlotController3D:
                 self.view.addItem(item)
 
     def _update_trails(self, positions: Dict[str, np.ndarray]) -> None:
-        """Draw motion trails for each part."""
+        """Draw motion trails for each part.
+
+        Issue 1 fix: Prunes trail_history entries for parts no longer in current
+        positions dict to prevent memory leak over long sessions when user changes
+        which parts are displayed.
+        """
+        # Issue 1 fix: Prune stale trail entries for parts no longer displayed
+        # First, identify parts that are in trail_history but not in current positions
+        stale_parts = [part for part in self.trail_history if part not in positions]
+        for part in stale_parts:
+            # Remove the trail graphics item from the view first
+            if part in self.trails:
+                try:
+                    self.view.removeItem(self.trails[part])
+                except Exception:
+                    pass
+                del self.trails[part]
+            # Then delete from trail_history dict
+            del self.trail_history[part]
+
+        # Update trails for current parts
         for part, pos in positions.items():
             hist = self.trail_history.setdefault(part, [])
             hist.append(pos)
@@ -433,4 +863,76 @@ class PlotController3D:
             "screen": ["screen", "display"],
         }
         return mapping.get(part, [part])
+
+    # ------------------------------------------------------------------
+    # Camera Controls
+    # ------------------------------------------------------------------
+    def set_view_preset(self, preset: str) -> None:
+        """Set camera to predefined viewpoint.
+
+        Args:
+            preset: One of 'top', 'front', 'side', 'left', 'back', 'isometric', 'reset'
+
+        pyqtgraph.opengl uses elevation (vertical angle) and azimuth (horizontal angle):
+        - elevation: 0 = horizontal, 90 = looking straight down
+        - azimuth: 0 = looking along +X, 90 = looking along +Y
+        """
+        presets = {
+            "top": {"elevation": 90, "azimuth": 0, "distance": 6},
+            "front": {"elevation": 0, "azimuth": 0, "distance": 6},
+            "back": {"elevation": 0, "azimuth": 180, "distance": 6},
+            "side": {"elevation": 0, "azimuth": 90, "distance": 6},
+            "left": {"elevation": 0, "azimuth": -90, "distance": 6},
+            "isometric": {"elevation": 30, "azimuth": 45, "distance": 6},
+            "reset": {"elevation": 30, "azimuth": 45, "distance": 6, "center": (0, 0, 0)},
+        }
+        if preset in presets:
+            params = presets[preset]
+            self.view.opts["elevation"] = params["elevation"]
+            self.view.opts["azimuth"] = params["azimuth"]
+            self.view.opts["distance"] = params["distance"]
+            if "center" in params:
+                self.view.opts["center"] = QtGui.QVector3D(*params["center"])
+            self.view.update()
+
+    def zoom_in(self, factor: float = 0.8) -> None:
+        """Zoom in by reducing camera distance.
+
+        Args:
+            factor: Multiplier for distance (< 1.0 zooms in). Default 0.8.
+        """
+        self.view.opts["distance"] *= factor
+        self.view.update()
+
+    def zoom_out(self, factor: float = 1.25) -> None:
+        """Zoom out by increasing camera distance.
+
+        Args:
+            factor: Multiplier for distance (> 1.0 zooms out). Default 1.25.
+        """
+        self.view.opts["distance"] *= factor
+        self.view.update()
+
+    def get_view_state(self) -> dict:
+        """Get current camera state for save/restore.
+
+        Returns:
+            Dictionary with elevation, azimuth, and distance values.
+        """
+        return {
+            "elevation": self.view.opts["elevation"],
+            "azimuth": self.view.opts["azimuth"],
+            "distance": self.view.opts["distance"],
+        }
+
+    def set_view_state(self, state: dict) -> None:
+        """Restore camera state from saved dict.
+
+        Args:
+            state: Dictionary with elevation, azimuth, and/or distance keys.
+        """
+        for key in ["elevation", "azimuth", "distance"]:
+            if key in state:
+                self.view.opts[key] = state[key]
+        self.view.update()
 

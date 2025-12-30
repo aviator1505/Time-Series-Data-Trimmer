@@ -40,6 +40,9 @@ class OperationRecord:
 class DataModel(QtCore.QObject):
     """Backend for time-series data with undo/redo and annotation support."""
 
+    # Epsilon for floating-point time comparisons (sub-nanosecond precision)
+    TIME_EPSILON = 1e-9
+
     dataChanged = QtCore.pyqtSignal()
     annotationsChanged = QtCore.pyqtSignal()
     statusMessage = QtCore.pyqtSignal(str)
@@ -59,6 +62,8 @@ class DataModel(QtCore.QObject):
         self._undo_stack: List[Tuple[pd.DataFrame, List[AnnotationSegment], List[Tuple[float, float]], List[OperationRecord]]] = []
         self._redo_stack: List[Tuple[pd.DataFrame, List[AnnotationSegment], List[Tuple[float, float]], List[OperationRecord]]] = []
         self._id_counter: int = 1
+        # User preference: whether to preserve timing gaps after deletion
+        self.preserve_timing_gaps: bool = False
 
     # ------------------------------------------------------------------
     # Loading and classification
@@ -130,7 +135,30 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Undo / redo helpers
     # ------------------------------------------------------------------
-    MAX_UNDO_STATES = 30  # Limit memory usage from undo stack (each state = full DataFrame copy)
+    MAX_UNDO_STATES = 30  # Limit number of undo states (fallback limit)
+    MAX_UNDO_MEMORY_MB = 500  # Maximum memory for undo stack in MB
+
+    def _estimate_undo_memory_mb(self) -> float:
+        """Estimate memory usage of undo stack in MB.
+
+        Calculates the approximate memory footprint of all DataFrame copies
+        stored in the undo stack. This is used to enforce memory limits and
+        provide user feedback about memory consumption.
+
+        Returns:
+            Estimated memory usage in megabytes.
+        """
+        total_bytes = 0
+        for state in self._undo_stack:
+            df, annotations, deletions, history = state
+            # DataFrame memory (deep=True includes object dtype overhead)
+            total_bytes += df.memory_usage(deep=True).sum()
+            # Annotations, deletions, and history are small relative to DataFrames,
+            # but we add a rough estimate for completeness
+            total_bytes += len(annotations) * 200  # ~200 bytes per annotation object
+            total_bytes += len(deletions) * 32  # ~32 bytes per tuple (two floats)
+            total_bytes += len(history) * 300  # ~300 bytes per OperationRecord
+        return total_bytes / (1024 * 1024)
 
     def _push_state(self) -> None:
         if self.df is None:
@@ -140,7 +168,16 @@ class DataModel(QtCore.QObject):
         )
         self._redo_stack.clear()
 
-        # Prune oldest states if stack exceeds limit
+        # Prune oldest states if memory exceeds limit
+        pruned_for_memory = False
+        while self._estimate_undo_memory_mb() > self.MAX_UNDO_MEMORY_MB and len(self._undo_stack) > 1:
+            self._undo_stack.pop(0)
+            pruned_for_memory = True
+        if pruned_for_memory:
+            mem_mb = self._estimate_undo_memory_mb()
+            self.statusMessage.emit(f"Undo stack pruned due to memory limit ({mem_mb:.1f} MB)")
+
+        # Fallback: prune oldest states if stack exceeds count limit
         while len(self._undo_stack) > self.MAX_UNDO_STATES:
             self._undo_stack.pop(0)
 
@@ -252,28 +289,40 @@ class DataModel(QtCore.QObject):
             self.statusMessage.emit("Invalid delete range")
             return
         self._push_state()
-        mask = (self.df["normalized_time"] < start) | (self.df["normalized_time"] > end)
+
+        # Use epsilon-tolerant comparison to handle floating-point precision
+        time_col = self.df["normalized_time"].values
+        in_segment = (time_col >= start - self.TIME_EPSILON) & (time_col <= end + self.TIME_EPSILON)
+        mask = ~in_segment
+        deleted_count = in_segment.sum()
+
         new_df = self.df.loc[mask].copy().reset_index(drop=True)
-        # recompute time using observed spacing (millisecond precision)
-        dt = 1.0 / max(self.sample_rate, 1e-6)
-        if "normalized_time" in new_df.columns and len(new_df) > 1:
-            diffs = np.diff(new_df["normalized_time"].to_numpy())
-            valid = diffs[diffs > 0]
-            if valid.size:
-                dt = float(np.median(valid))
-        dt = round(dt, 3)  # millisecond precision
-        new_time = np.round(np.arange(len(new_df)) * dt, 3)
-        new_df["normalized_time"] = new_time
-        self.sample_rate = round(1.0 / max(dt, 1e-6), 3)
+
+        if self.preserve_timing_gaps:
+            # Option A: Keep original timestamps (preserves gaps in timeline)
+            # This is useful for analyzing timing patterns in scientific data
+            pass
+        else:
+            # Option B: Shift subsequent timestamps to close the gap (default)
+            # This maintains a continuous timeline after deletion
+            deletion_duration = end - start
+            if "normalized_time" in new_df.columns and len(new_df) > 0:
+                new_time = new_df["normalized_time"].values.copy()
+                # Shift all timestamps that were after the deletion
+                post_deletion_mask = new_time > (end + self.TIME_EPSILON)
+                new_time[post_deletion_mask] -= deletion_duration
+                # Round to millisecond precision for cleaner display
+                new_df["normalized_time"] = np.round(new_time, 3)
+
         self.df = new_df
         self.deletions.append((start, end))
-        self.history.append(OperationRecord("delete_segment", {"deleted_samples": (~mask).sum()}, start, end))
+        self.history.append(OperationRecord("delete_segment", {"deleted_samples": int(deleted_count)}, start, end))
         # Adjust annotation boundaries to account for collapsed timeline
         self._adjust_annotations_after_deletion(start, end)
         self.dataChanged.emit()
         self.annotationsChanged.emit()
         self.historyChanged.emit()
-        self.statusMessage.emit(f"Deleted {start:.3f}-{end:.3f} s")
+        self.statusMessage.emit(f"Deleted {start:.3f}-{end:.3f} s ({deleted_count} samples)")
 
     def mark_bad(self, start: float, end: float) -> None:
         if self.df is None or start >= end:
@@ -401,7 +450,19 @@ class DataModel(QtCore.QObject):
             data = json.load(f)
         anns = data.get("annotations", [])
         dels = data.get("deletions", [])
-        self.annotations = [AnnotationSegment(**a) for a in anns]
+
+        # Robust annotation deserialization: skip malformed entries
+        parsed_annotations: List[AnnotationSegment] = []
+        skipped_count = 0
+        for a in anns:
+            try:
+                parsed_annotations.append(AnnotationSegment(**a))
+            except (TypeError, ValueError):
+                skipped_count += 1
+                continue
+        self.annotations = parsed_annotations
+        if skipped_count > 0:
+            self.statusMessage.emit(f"Skipped {skipped_count} malformed annotations")
         parsed_deletions: List[Tuple[float, float]] = []
         for d in dels:
             if isinstance(d, dict) and "start" in d and "end" in d:
@@ -628,6 +689,21 @@ class DataModel(QtCore.QObject):
         self.dataChanged.emit()
         self.historyChanged.emit()
 
-    def set_sample_rate(self, fs: float) -> None:
+    def set_sample_rate(self, fs: float, recalculate_time: bool = False) -> None:
+        """Set the sample rate.
+
+        Args:
+            fs: New sample rate in Hz
+            recalculate_time: If True, regenerate normalized_time based on new rate
+        """
+        old_rate = self.sample_rate
         self.sample_rate = float(fs)
-        self.statusMessage.emit(f"Sampling rate set to {self.sample_rate} Hz")
+
+        if recalculate_time and self.df is not None and "normalized_time" in self.df.columns:
+            # Regenerate time axis based on new sample rate
+            n = len(self.df)
+            self.df["normalized_time"] = np.arange(n) / self.sample_rate
+            self.dataChanged.emit()
+            self.statusMessage.emit(f"Sampling rate changed from {old_rate:.1f} to {self.sample_rate:.1f} Hz (time axis recalculated)")
+        else:
+            self.statusMessage.emit(f"Sampling rate set to {self.sample_rate} Hz")
