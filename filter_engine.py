@@ -93,6 +93,9 @@ class FilterEngine:
             elif filter_type == "invert_reference":
                 ref = float(params.get("reference", 0.0))
                 filtered = 2 * ref - series
+            elif filter_type == "constant_offset":
+                offset = float(params.get("offset", 0.0))
+                filtered = series + offset
             else:
                 filtered = series
             out.loc[mask, ch] = filtered
@@ -114,28 +117,65 @@ class FilterEngine:
             x = np.arange(lo, hi)
             y = data[lo:hi]
             try:
-                coeffs = np.polyfit(x, y, deg=min(poly, len(x) - 1))
-                out[i] = np.polyval(coeffs, i)
+                # Center x-coordinates for numerical stability
+                x_shifted = x - i
+                coeffs = np.polyfit(x_shifted, y, deg=min(poly, len(x) - 1))
+                out[i] = np.polyval(coeffs, 0)  # Evaluate at center (x=0)
             except Exception:
                 out[i] = data[i]
         return out
 
     def _butter_lowpass(self, data: np.ndarray, cutoff: float, order: int) -> np.ndarray:
+        nyq = 0.5 * self.sample_rate
+
+        # Validate cutoff against Nyquist frequency
+        if cutoff >= nyq:
+            raise ValueError(
+                f"Cutoff frequency ({cutoff} Hz) must be less than Nyquist frequency ({nyq} Hz). "
+                f"Either lower the cutoff or increase the sample rate."
+            )
+
         if signal is None or cutoff <= 0:
             # fallback to moving average if SciPy is unavailable
             window = max(3, int(self.sample_rate / max(cutoff, 1)))
             return pd.Series(data).rolling(window=window, min_periods=1, center=True).mean().to_numpy()
-        nyq = 0.5 * self.sample_rate
         normal_cutoff = cutoff / nyq
         b, a = signal.butter(order, normal_cutoff, btype="low", analog=False)
         return signal.filtfilt(b, a, data)
 
     def _butter_bandpass(self, data: np.ndarray, low_cut: float, high_cut: float, order: int) -> np.ndarray:
-        if signal is None:
-            # simple detrend + lowpass fallback
-            data = self._detrend(data)
-            return self._butter_lowpass(data, high_cut, order)
         nyq = 0.5 * self.sample_rate
+
+        # Validate low_cut < high_cut
+        if low_cut >= high_cut:
+            raise ValueError(
+                f"Low cutoff frequency ({low_cut} Hz) must be less than high cutoff frequency ({high_cut} Hz)."
+            )
+
+        # Validate both cutoff frequencies against Nyquist
+        if low_cut >= nyq:
+            raise ValueError(
+                f"Low cutoff frequency ({low_cut} Hz) must be less than Nyquist frequency ({nyq} Hz). "
+                f"Either lower the cutoff or increase the sample rate."
+            )
+        if high_cut >= nyq:
+            raise ValueError(
+                f"High cutoff frequency ({high_cut} Hz) must be less than Nyquist frequency ({nyq} Hz). "
+                f"Either lower the cutoff or increase the sample rate."
+            )
+
+        if signal is None:
+            # Proper bandpass fallback: highpass + lowpass cascade
+            # 1. Approximate highpass by subtracting lowpass at low_cut frequency
+            lowpass_low_window = max(3, int(self.sample_rate / max(low_cut, 0.1)))
+            lowpass_low = pd.Series(data).rolling(
+                window=lowpass_low_window, min_periods=1, center=True
+            ).mean().to_numpy()
+            highpassed = data - lowpass_low
+
+            # 2. Then apply lowpass at high_cut
+            return self._butter_lowpass(highpassed, high_cut, order)
+
         low = low_cut / nyq
         high = high_cut / nyq
         b, a = signal.butter(order, [low, high], btype="band")
@@ -170,7 +210,20 @@ class FilterEngine:
             if col == "normalized_time":
                 continue
             if pd.api.types.is_numeric_dtype(df[col]):
-                out[col] = np.interp(t_new, t_old, df[col].to_numpy())
+                arr = df[col].to_numpy()
+                valid_mask = np.isfinite(arr)
+                if valid_mask.all():
+                    # All values valid: use normal interpolation
+                    out[col] = np.interp(t_new, t_old, arr)
+                elif valid_mask.any():
+                    # Some NaN values: interpolate only valid values
+                    out[col] = np.interp(t_new, t_old[valid_mask], arr[valid_mask])
+                    # Mark regions that were originally NaN
+                    nan_interp = np.interp(t_new, t_old, (~valid_mask).astype(float))
+                    out.loc[nan_interp > 0.5, col] = np.nan
+                else:
+                    # All NaN input: output all NaN
+                    out[col] = np.nan
             else:
                 out[col] = df[col].iloc[0]
         if "is_bad_segment" in df.columns:
@@ -197,5 +250,6 @@ def available_filters() -> List[str]:
         "invert_polarity",
         "invert_mean",
         "invert_reference",
+        "constant_offset",
     ]
 

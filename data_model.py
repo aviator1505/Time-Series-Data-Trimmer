@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -24,7 +25,7 @@ class AnnotationSegment:
     label: str
     track: str = "default"
     color: str = "#4e79a7"
-    id: int = field(default_factory=int)
+    id: int = field(default_factory=lambda: uuid.uuid4().int & 0x7FFFFFFF)
     episode_index: Optional[int] = None  # Manual episode index override for CSV export
 
 
@@ -129,6 +130,8 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Undo / redo helpers
     # ------------------------------------------------------------------
+    MAX_UNDO_STATES = 30  # Limit memory usage from undo stack (each state = full DataFrame copy)
+
     def _push_state(self) -> None:
         if self.df is None:
             return
@@ -136,6 +139,10 @@ class DataModel(QtCore.QObject):
             (self.df.copy(), list(self.annotations), list(self.deletions), list(self.history))
         )
         self._redo_stack.clear()
+
+        # Prune oldest states if stack exceeds limit
+        while len(self._undo_stack) > self.MAX_UNDO_STATES:
+            self._undo_stack.pop(0)
 
     def undo(self) -> None:
         if not self._undo_stack:
@@ -168,6 +175,78 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Core editing operations
     # ------------------------------------------------------------------
+    def _adjust_annotations_after_deletion(self, start: float, end: float) -> None:
+        """Adjust annotation boundaries after a segment deletion.
+
+        This method modifies self.annotations in-place to account for the
+        collapsed timeline after a segment [start, end] is deleted.
+
+        Rules applied (in order of precedence):
+        - Annotation entirely BEFORE deletion (ann.end <= start): Keep unchanged
+        - Annotation entirely AFTER deletion (ann.start >= end): Shift backwards by deletion_duration
+        - Annotation entirely INSIDE deletion (ann.start >= start AND ann.end <= end): Remove
+        - Annotation SPANS deletion (ann.start < start AND ann.end > end): Shrink end by deletion_duration
+        - Annotation overlaps START of deletion (ann.start < start AND ann.end <= end): Truncate ann.end to start
+        - Annotation overlaps END of deletion (ann.start >= start AND ann.end > end): Set ann.start = start, shift ann.end
+
+        Args:
+            start: Start time of the deleted segment
+            end: End time of the deleted segment
+        """
+        if not self.annotations:
+            return
+
+        deletion_duration = end - start
+        adjusted_annotations: List[AnnotationSegment] = []
+
+        for ann in self.annotations:
+            # Case 1: Entirely BEFORE deletion - keep unchanged
+            if ann.end <= start:
+                adjusted_annotations.append(ann)
+                continue
+
+            # Case 2: Entirely AFTER deletion - shift backwards
+            if ann.start >= end:
+                ann.start -= deletion_duration
+                ann.end -= deletion_duration
+                adjusted_annotations.append(ann)
+                continue
+
+            # Case 3: Entirely INSIDE deletion - remove (skip appending)
+            if ann.start >= start and ann.end <= end:
+                # Annotation is completely within the deleted region - remove it
+                continue
+
+            # Case 4: SPANS deletion (starts before, ends after)
+            if ann.start < start and ann.end > end:
+                # Shrink the annotation by the deletion duration
+                ann.end -= deletion_duration
+                adjusted_annotations.append(ann)
+                continue
+
+            # Case 5: Overlaps START of deletion (starts before, ends inside/at deletion)
+            if ann.start < start and ann.end > start and ann.end <= end:
+                # Truncate the end to the deletion start
+                ann.end = start
+                # Only keep if annotation still has positive duration
+                if ann.end > ann.start:
+                    adjusted_annotations.append(ann)
+                continue
+
+            # Case 6: Overlaps END of deletion (starts inside/at deletion, ends after)
+            if ann.start >= start and ann.start < end and ann.end > end:
+                # The portion after deletion becomes the annotation
+                # New start is at the deletion start (where the post-deletion content now begins)
+                ann.start = start
+                # Shift end backwards by deletion duration
+                ann.end -= deletion_duration
+                # Only keep if annotation still has positive duration
+                if ann.end > ann.start:
+                    adjusted_annotations.append(ann)
+                continue
+
+        self.annotations = adjusted_annotations
+
     def delete_segment(self, start: float, end: float) -> None:
         if self.df is None or start >= end:
             self.statusMessage.emit("Invalid delete range")
@@ -189,6 +268,8 @@ class DataModel(QtCore.QObject):
         self.df = new_df
         self.deletions.append((start, end))
         self.history.append(OperationRecord("delete_segment", {"deleted_samples": (~mask).sum()}, start, end))
+        # Adjust annotation boundaries to account for collapsed timeline
+        self._adjust_annotations_after_deletion(start, end)
         self.dataChanged.emit()
         self.annotationsChanged.emit()
         self.historyChanged.emit()
@@ -233,6 +314,7 @@ class DataModel(QtCore.QObject):
         color: Optional[str],
         episode_index: Optional[int] = None
     ) -> None:
+        self._push_state()  # Capture state before mutation for undo support
         for ann in self.annotations:
             if ann.id == ann_id:
                 ann.start = start
@@ -246,12 +328,15 @@ class DataModel(QtCore.QObject):
                 # episode_index can be set to None (auto) or a specific value
                 ann.episode_index = episode_index
                 self.annotationsChanged.emit()
+                self.historyChanged.emit()
                 self.statusMessage.emit(f"Updated annotation {ann_id}")
                 break
 
     def delete_annotation(self, ann_id: int) -> None:
+        self._push_state()  # Capture state before mutation for undo support
         self.annotations = [a for a in self.annotations if a.id != ann_id]
         self.annotationsChanged.emit()
+        self.historyChanged.emit()
 
     def get_dataframe(self) -> pd.DataFrame:
         return self.df.copy() if self.df is not None else pd.DataFrame()

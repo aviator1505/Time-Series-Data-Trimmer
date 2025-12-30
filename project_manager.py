@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from typing import Dict, List, Optional
 
 
@@ -129,13 +130,69 @@ class ProjectManager:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.project_path = path
-        self.trials = [TrialEntry(**t) for t in data.get("trials", [])]
-        self.recipes = [Recipe(**r) for r in data.get("recipes", [])]
-        self.preferences = data.get("preferences", self.preferences)
+
+        # Safely load trials with unknown field tolerance
+        trials_data = data.get("trials", [])
+        self.trials = []
+        known_trial_fields = {f.name for f in fields(TrialEntry)}
+        for t in trials_data:
+            filtered = {k: v for k, v in t.items() if k in known_trial_fields}
+            self.trials.append(TrialEntry(**filtered))
+
+        # Same for recipes
+        recipes_data = data.get("recipes", [])
+        self.recipes = []
+        known_recipe_fields = {f.name for f in fields(Recipe)}
+        for r in recipes_data:
+            filtered = {k: v for k, v in r.items() if k in known_recipe_fields}
+            self.recipes.append(Recipe(**filtered))
+
+        # Merge preferences to preserve new defaults
+        self.preferences = {**self.preferences, **data.get("preferences", {})}
 
     def export_summary(self) -> List[Dict]:
         return [asdict(t) for t in self.trials]
 
     def add_recipe(self, recipe: Recipe) -> None:
         self.recipes.append(recipe)
+
+
+# ---------------------------------------------------------------------------
+# Global signal preset persistence (independent of projects)
+# ---------------------------------------------------------------------------
+
+
+def _get_presets_path() -> pathlib.Path:
+    """Get platform-appropriate path for signal presets."""
+    if os.name == 'nt':  # Windows
+        base = pathlib.Path(os.environ.get('APPDATA', pathlib.Path.home()))
+    else:  # macOS/Linux
+        base = pathlib.Path.home() / '.config'
+
+    app_dir = base / 'TimeSeriesDataTrimmer'
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir / 'signal_presets.json'
+
+
+SIGNAL_PRESETS_FILE = _get_presets_path()
+
+
+def load_signal_presets() -> Dict[str, Dict]:
+    """Load signal presets from disk."""
+    if not SIGNAL_PRESETS_FILE.is_file():
+        return {}
+    try:
+        with open(SIGNAL_PRESETS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_signal_presets(presets: Dict[str, Dict]) -> None:
+    """Save signal presets to disk."""
+    try:
+        with open(SIGNAL_PRESETS_FILE, "w", encoding="utf-8") as f:
+            json.dump(presets, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save presets: {e}")
 

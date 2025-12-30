@@ -30,6 +30,7 @@ FILTER_PARAM_MAP: Dict[str, List[str]] = {
     "invert_polarity": [],
     "invert_mean": [],
     "invert_reference": ["reference"],
+    "constant_offset": ["offset"],
 }
 
 FILTER_DESCRIPTIONS: Dict[str, str] = {
@@ -50,6 +51,7 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
     "invert_polarity": "Negate all values in the signal (-x).",
     "invert_mean": "Flip values around the channel mean (2*mean - x).",
     "invert_reference": "Flip values around a specified reference point (2*ref - x).",
+    "constant_offset": "Add/subtract a constant value (e.g., +180 to shift angles).",
 }
 
 INTERPOLATE_METHODS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
@@ -91,10 +93,12 @@ class FilterDialog(QtWidgets.QDialog):
         self.window_spin = QtWidgets.QSpinBox()
         self.window_spin.setRange(3, 1001)
         self.window_spin.setValue(11)
+        self.window_spin.setToolTip("Window must be odd and > polynomial order")
         self._add_param_row(form, "Window (samples)", self.window_spin, "window")
         self.poly_spin = QtWidgets.QSpinBox()
         self.poly_spin.setRange(1, 5)
         self.poly_spin.setValue(2)
+        self.poly_spin.setToolTip("Must be less than window size")
         self._add_param_row(form, "Poly order", self.poly_spin, "polyorder")
         self.cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.cutoff_spin.setRange(0.1, 60.0)
@@ -123,6 +127,11 @@ class FilterDialog(QtWidgets.QDialog):
         self.reference_spin.setDecimals(4)
         self.reference_spin.setValue(0.0)
         self._add_param_row(form, "Reference value", self.reference_spin, "reference")
+        self.offset_spin = QtWidgets.QDoubleSpinBox()
+        self.offset_spin.setRange(-1e9, 1e9)
+        self.offset_spin.setDecimals(4)
+        self.offset_spin.setValue(0.0)
+        self._add_param_row(form, "Offset value", self.offset_spin, "offset")
         layout.addLayout(form)
         self.filter_help = QtWidgets.QLabel()
         self.filter_help.setWordWrap(True)
@@ -149,6 +158,29 @@ class FilterDialog(QtWidgets.QDialog):
 
     def parameters(self) -> Dict:
         filter_type = self.filter_combo.currentText()
+
+        # Validate filter-specific parameters BEFORE returning
+        if filter_type == "savgol":
+            window = self.window_spin.value()
+            polyorder = self.poly_spin.value()
+            if polyorder >= window:
+                raise ValueError(
+                    f"Polynomial order ({polyorder}) must be less than window size ({window}).\n"
+                    f"Either increase window or decrease polynomial order."
+                )
+            if window % 2 == 0:
+                # Auto-correct even window to odd
+                window += 1
+                self.window_spin.setValue(window)
+
+        elif filter_type == "butter_bandpass":
+            low = self.cutoff_spin.value()  # This maps to "low_cut" for bandpass
+            high = self.high_cutoff_spin.value()
+            if low >= high:
+                raise ValueError(
+                    f"Low cutoff ({low} Hz) must be less than high cutoff ({high} Hz)."
+                )
+
         params: Dict[str, object] = {
             "preset": self.preset_combo.currentText(),
             "filter": filter_type,
@@ -195,6 +227,8 @@ class FilterDialog(QtWidgets.QDialog):
             return self.method_combo.currentText()
         if key == "reference":
             return self.reference_spin.value()
+        if key == "offset":
+            return self.offset_spin.value()
         return None
 
     def _apply_preset(self) -> None:
@@ -253,10 +287,12 @@ class FilterPanel(QtWidgets.QWidget):
         self.window_spin = QtWidgets.QSpinBox()
         self.window_spin.setRange(3, 1001)
         self.window_spin.setValue(11)
+        self.window_spin.setToolTip("Window must be odd and > polynomial order")
         self._add_param_row(form, "Window (samples)", self.window_spin, "window")
         self.poly_spin = QtWidgets.QSpinBox()
         self.poly_spin.setRange(1, 5)
         self.poly_spin.setValue(2)
+        self.poly_spin.setToolTip("Must be less than window size")
         self._add_param_row(form, "Poly order", self.poly_spin, "polyorder")
         self.cutoff_spin = QtWidgets.QDoubleSpinBox()
         self.cutoff_spin.setRange(0.1, 60.0)
@@ -285,6 +321,11 @@ class FilterPanel(QtWidgets.QWidget):
         self.reference_spin.setDecimals(4)
         self.reference_spin.setValue(0.0)
         self._add_param_row(form, "Reference value", self.reference_spin, "reference")
+        self.offset_spin = QtWidgets.QDoubleSpinBox()
+        self.offset_spin.setRange(-1e9, 1e9)
+        self.offset_spin.setDecimals(4)
+        self.offset_spin.setValue(0.0)
+        self._add_param_row(form, "Offset value", self.offset_spin, "offset")
         layout.addLayout(form)
         self.filter_help = QtWidgets.QLabel()
         self.filter_help.setWordWrap(True)
@@ -334,6 +375,29 @@ class FilterPanel(QtWidgets.QWidget):
 
     def parameters(self, preview: bool = False) -> Dict:
         filter_type = self.filter_combo.currentText()
+
+        # Validate filter-specific parameters BEFORE returning
+        if filter_type == "savgol":
+            window = self.window_spin.value()
+            polyorder = self.poly_spin.value()
+            if polyorder >= window:
+                raise ValueError(
+                    f"Polynomial order ({polyorder}) must be less than window size ({window}).\n"
+                    f"Either increase window or decrease polynomial order."
+                )
+            if window % 2 == 0:
+                # Auto-correct even window to odd
+                window += 1
+                self.window_spin.setValue(window)
+
+        elif filter_type == "butter_bandpass":
+            low = self.cutoff_spin.value()  # This maps to "low_cut" for bandpass
+            high = self.high_cutoff_spin.value()
+            if low >= high:
+                raise ValueError(
+                    f"Low cutoff ({low} Hz) must be less than high cutoff ({high} Hz)."
+                )
+
         params: Dict[str, object] = {
             "preset": self.preset_combo.currentText(),
             "filter": filter_type,
@@ -392,6 +456,8 @@ class FilterPanel(QtWidgets.QWidget):
             return self.method_combo.currentText()
         if key == "reference":
             return self.reference_spin.value()
+        if key == "offset":
+            return self.offset_spin.value()
         return None
 
 

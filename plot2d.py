@@ -12,6 +12,30 @@ import pyqtgraph as pg
 from data_model import AnnotationSegment
 
 
+# Colorblind-safe palette (IBM Design Language)
+# Optimized for deuteranopia (red-green color blindness, affects ~8% of males)
+COLORBLIND_PALETTE = [
+    (100, 143, 255),   # Blue
+    (220, 38, 127),    # Magenta
+    (254, 97, 0),      # Orange
+    (255, 176, 0),     # Yellow
+    (0, 0, 0),         # Black
+    (120, 94, 240),    # Purple
+    (0, 176, 80),      # Green
+]
+
+# Default palette (original)
+DEFAULT_PALETTE = [
+    (78, 121, 167),
+    (255, 87, 87),
+    (89, 161, 79),
+    (242, 142, 43),
+    (237, 201, 72),
+    (144, 103, 167),
+    (188, 189, 34),
+]
+
+
 class PlotController2D:
     def __init__(self) -> None:
         self.widget = pg.GraphicsLayoutWidget()
@@ -53,6 +77,7 @@ class PlotController2D:
         self.plot_channels: Dict[pg.PlotItem, List[str]] = {}
         self.time_values: np.ndarray = np.array([])
         self.hover_threshold_px = 20.0
+        self.colorblind_mode: bool = False
         self.set_style()
 
     def set_style(self) -> None:
@@ -117,17 +142,21 @@ class PlotController2D:
             self.set_time_cursor(cursor_pos)
 
     def _color_for_channel(self, ch: str) -> Tuple[int, int, int]:
-        palette = [
-            (78, 121, 167),
-            (255, 87, 87),
-            (89, 161, 79),
-            (242, 142, 43),
-            (237, 201, 72),
-            (144, 103, 167),
-            (188, 189, 34),
-        ]
+        palette = COLORBLIND_PALETTE if self.colorblind_mode else DEFAULT_PALETTE
         idx = abs(hash(ch)) % len(palette)
         return palette[idx]
+
+    def set_colorblind_mode(self, enabled: bool) -> None:
+        """Enable or disable colorblind-friendly color palette.
+
+        When enabled, uses IBM Design Language colorblind-safe palette
+        optimized for deuteranopia (red-green color blindness).
+
+        Args:
+            enabled: True to use colorblind-safe palette, False for default
+        """
+        self.colorblind_mode = enabled
+        self.refresh_plots()
 
     def ensure_selection_region(self) -> None:
         if self.selection_region is None:
@@ -329,34 +358,46 @@ class PlotController2D:
         channels = self.plot_channels.get(plot, [])
         if not channels or self.time_values.size == 0:
             return None
+
         vb = plot.getViewBox()
         if vb is None:
             return None
+
         view_pos = vb.mapSceneToView(scene_pos)
         t_guess = view_pos.x()
+
+        # Binary search for O(log N) time lookup
         idx = int(np.searchsorted(self.time_values, t_guess))
-        candidate_idxs = [idx - 1, idx, idx + 1]
-        candidate_idxs = [i for i in candidate_idxs if 0 <= i < len(self.time_values)]
-        best: Optional[Tuple[str, float, float]] = None
-        best_dist: Optional[float] = None
-        for i in candidate_idxs:
-            t_val = float(self.time_values[i])
-            for ch in channels:
-                if ch not in self.data.columns:
-                    continue
-                y_val = float(self.data[ch].iat[i])
-                if pd.isna(y_val):
-                    continue
-                pt_scene = vb.mapViewToScene(QtCore.QPointF(t_val, y_val))
-                dx = float(pt_scene.x() - scene_pos.x())
-                dy = float(pt_scene.y() - scene_pos.y())
-                dist = dx * dx + dy * dy
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    best = (ch, t_val, y_val)
-        if best_dist is None or best_dist > self.hover_threshold_px ** 2:
+        idx = np.clip(idx, 0, len(self.time_values) - 1)
+
+        # Only check the single nearest time point
+        t_val = float(self.time_values[idx])
+
+        # Find closest channel at this time (O(C) but C is typically small)
+        best_ch = None
+        best_dist = float('inf')
+        best_y = 0.0
+
+        for ch in channels:
+            if ch not in self.data.columns:
+                continue
+            y_val = float(self.data[ch].iat[idx])
+            if pd.isna(y_val):
+                continue
+
+            pt_scene = vb.mapViewToScene(QtCore.QPointF(t_val, y_val))
+            dx = float(pt_scene.x() - scene_pos.x())
+            dy = float(pt_scene.y() - scene_pos.y())
+            dist = dx * dx + dy * dy
+
+            if dist < best_dist:
+                best_dist = dist
+                best_ch = ch
+                best_y = y_val
+
+        if best_dist > self.hover_threshold_px ** 2 or best_ch is None:
             return None
-        return best
+        return (best_ch, t_val, best_y)
 
     def _on_mouse_moved(self, evt) -> None:
         if not self.plots or self.data.empty:

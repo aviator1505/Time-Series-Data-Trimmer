@@ -55,7 +55,7 @@ from filter_engine import FilterEngine
 from plot2d import PlotController2D
 from plot3d import PlotController3D
 from plugin_system import PluginManager
-from project_manager import ProjectManager
+from project_manager import ProjectManager, load_signal_presets, save_signal_presets
 
 
 class ChannelManagerWidget(QtWidgets.QWidget):
@@ -65,6 +65,7 @@ class ChannelManagerWidget(QtWidgets.QWidget):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
+        self.style_panel: Optional["ChannelStylePanel"] = None  # set externally
         layout = QtWidgets.QVBoxLayout(self)
         self.time_list = QtWidgets.QListWidget()
         self.meta_list = QtWidgets.QListWidget()
@@ -82,13 +83,17 @@ class ChannelManagerWidget(QtWidgets.QWidget):
         layout.addWidget(self.signal_container, 1)
         self.presets_combo = QtWidgets.QComboBox()
         self.presets_combo.setEditable(True)
-        self.save_preset_btn = QtWidgets.QPushButton("Save preset")
+        self.save_preset_btn = QtWidgets.QPushButton("Save")
+        self.delete_preset_btn = QtWidgets.QPushButton("Delete")
         p_layout = QtWidgets.QHBoxLayout()
-        p_layout.addWidget(self.presets_combo)
+        p_layout.addWidget(self.presets_combo, 1)
         p_layout.addWidget(self.save_preset_btn)
+        p_layout.addWidget(self.delete_preset_btn)
         layout.addLayout(p_layout)
-        self.presets: Dict[str, List[str]] = {}
+        self.presets: Dict[str, Dict] = load_signal_presets()
+        self._populate_preset_combo()
         self.save_preset_btn.clicked.connect(self.save_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_preset)
         self.presets_combo.currentIndexChanged.connect(self.apply_preset)
 
     def populate(self, time_cols: List[str], meta_cols: List[str], signal_cols: Dict[str, List[str]]) -> None:
@@ -128,23 +133,51 @@ class ChannelManagerWidget(QtWidgets.QWidget):
                 channels.append(w.text())
         return channels
 
+    def _populate_preset_combo(self) -> None:
+        """Populate the preset combo box from loaded presets."""
+        self.presets_combo.blockSignals(True)
+        self.presets_combo.clear()
+        self.presets_combo.addItem("")  # empty default
+        for name in self.presets:
+            self.presets_combo.addItem(name)
+        self.presets_combo.blockSignals(False)
+
     def save_preset(self) -> None:
         name = self.presets_combo.currentText().strip()
         if not name:
             return
-        self.presets[name] = self.get_checked_channels()
+        channels = self.get_checked_channels()
+        styles = self.style_panel.get_all_styles() if self.style_panel else {}
+        self.presets[name] = {"channels": channels, "styles": styles}
+        save_signal_presets(self.presets)
         if self.presets_combo.findText(name) == -1:
             self.presets_combo.addItem(name)
 
     def apply_preset(self) -> None:
         name = self.presets_combo.currentText()
-        chans = self.presets.get(name, [])
-        if not chans:
+        preset = self.presets.get(name)
+        if not preset:
             return
+        channels = preset.get("channels", [])
+        styles = preset.get("styles", {})
+        # Apply channel checkboxes
         for i in range(self.signal_layout.count()):
             w = self.signal_layout.itemAt(i).widget()
             if isinstance(w, QtWidgets.QCheckBox):
-                w.setChecked(w.text() in chans)
+                w.setChecked(w.text() in channels)
+        # Apply styles
+        if self.style_panel:
+            self.style_panel.set_styles(styles)
+
+    def delete_preset(self) -> None:
+        name = self.presets_combo.currentText().strip()
+        if not name or name not in self.presets:
+            return
+        del self.presets[name]
+        save_signal_presets(self.presets)
+        idx = self.presets_combo.findText(name)
+        if idx != -1:
+            self.presets_combo.removeItem(idx)
 
 
 class ChannelStylePanel(QtWidgets.QWidget):
@@ -191,6 +224,26 @@ class ChannelStylePanel(QtWidgets.QWidget):
         style_key = combo.currentData()
         self.styles[channel] = style_key
         self.styleChanged.emit(channel, style_key)
+
+    def get_all_styles(self) -> Dict[str, str]:
+        """Return all non-default style assignments."""
+        return {ch: style for ch, style in self.styles.items() if style}
+
+    def set_styles(self, styles: Dict[str, str]) -> None:
+        """Apply style mapping from a preset."""
+        for i in range(self.container_layout.rowCount()):
+            label_item = self.container_layout.itemAt(i, QtWidgets.QFormLayout.ItemRole.LabelRole)
+            field_item = self.container_layout.itemAt(i, QtWidgets.QFormLayout.ItemRole.FieldRole)
+            if label_item and field_item:
+                label_widget = label_item.widget()
+                combo = field_item.widget()
+                if label_widget and isinstance(combo, QtWidgets.QComboBox):
+                    ch = label_widget.text()
+                    style = styles.get(ch, "")
+                    idx = combo.findData(style)
+                    if idx != -1:
+                        combo.setCurrentIndex(idx)
+                        self.styles[ch] = style
 
 
 class OperationHistoryWidget(QtWidgets.QListWidget):
@@ -482,6 +535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_dock = self._add_dock("Filters", self.filter_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
         self.style_dock = self._add_dock("Plot styles", self.style_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
         self._add_dock("Channel Manager", self.channel_manager, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.channel_manager.style_panel = self.style_panel
         self._add_dock("Annotations", self.ann_table, QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
         self._add_dock("Operation History", self.history_widget, QtCore.Qt.DockWidgetArea.BottomDockWidgetArea)
         self._add_dock("Project", self.project_panel, QtCore.Qt.DockWidgetArea.LeftDockWidgetArea)
@@ -810,8 +864,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.frames = frames
             self.plot3d.set_frames(self.frames)
             self.statusBar().showMessage(f"Loaded transforms from {path}")
+        except json.JSONDecodeError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Load Error",
+                f"Invalid JSON format in transforms file:\n{exc.msg} at line {exc.lineno}"
+            )
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(
+                self, "Load Error",
+                f"Transforms file not found:\n{path}"
+            )
+        except PermissionError:
+            QtWidgets.QMessageBox.warning(
+                self, "Load Error",
+                f"Permission denied reading transforms file:\n{path}"
+            )
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Load error", str(exc))
+            QtWidgets.QMessageBox.warning(
+                self, "Load Error",
+                f"Failed to load transforms:\n{type(exc).__name__}: {exc}"
+            )
 
     def on_filters(self) -> None:
         if self.filter_dock:
@@ -825,41 +897,90 @@ class MainWindow(QtWidgets.QMainWindow):
         if not chans:
             self.statusBar().showMessage("Select at least one channel to filter")
             return
-        params = self.filter_panel.parameters(preview=preview)
+        try:
+            params = self.filter_panel.parameters(preview=preview)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Invalid Parameters", str(e))
+            return
         selection = None
         if params.pop("apply_selection") and all(self.selection):
             selection = tuple(sorted(self.selection))  # type: ignore
         filter_type = params.pop("filter")
         preview_flag = params.pop("preview", False)
         df_current = self.data_model.get_dataframe()
-        df_new = self.filter_engine.apply(
-            df_current, chans, filter_type, params, selection=selection
-        )
-        if filter_type == "resample":
-            self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
-        if preview_flag and chans:
-            ch = chans[0]
-            time = df_new["normalized_time"].to_numpy()
-            orig_series = df_current[ch]
-            orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
-            filt = df_new[ch].to_numpy()
-            orig = orig_series.to_numpy()
-            if len(time) != len(orig) or len(time) != len(filt):
-                try:
-                    # interpolate original onto new time base for preview
-                    orig = np.interp(time, orig_time, orig_series)
-                except Exception:
-                    # last resort: truncate to common minimum length
-                    n = min(len(time), len(orig), len(filt))
-                    time = time[:n]
-                    orig = orig[:n]
-                    filt = filt[:n]
-            prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
-            if not prev_dlg.exec():
-                return
-        start = selection[0] if selection else 0.0
-        end = selection[1] if selection else df_new["normalized_time"].max()
-        self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
+
+        # Progress indication for large datasets
+        row_count = len(df_current)
+        progress = None
+        if row_count > 10000 and not preview:
+            progress = QtWidgets.QProgressDialog(
+                "Applying filter...", "Cancel", 0, 100, self
+            )
+            progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+            progress.setValue(10)
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            if progress:
+                progress.setValue(30)
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    return
+
+            df_new = self.filter_engine.apply(
+                df_current, chans, filter_type, params, selection=selection
+            )
+
+            if progress:
+                progress.setValue(70)
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    return
+
+            if filter_type == "resample":
+                self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
+            if preview_flag and chans:
+                ch = chans[0]
+                time = df_new["normalized_time"].to_numpy()
+                orig_series = df_current[ch]
+                orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
+                filt = df_new[ch].to_numpy()
+                orig = orig_series.to_numpy()
+                if len(time) != len(orig) or len(time) != len(filt):
+                    try:
+                        # interpolate original onto new time base for preview
+                        orig = np.interp(time, orig_time, orig_series)
+                    except Exception:
+                        # last resort: truncate to common minimum length
+                        n = min(len(time), len(orig), len(filt))
+                        time = time[:n]
+                        orig = orig[:n]
+                        filt = filt[:n]
+                prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
+                if not prev_dlg.exec():
+                    return
+
+            if progress:
+                progress.setValue(90)
+                QtWidgets.QApplication.processEvents()
+
+            start = selection[0] if selection else 0.0
+            end = selection[1] if selection else df_new["normalized_time"].max()
+            self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
+
+            if progress:
+                progress.setValue(100)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Filter Error",
+                f"Invalid filter parameters:\n{e}"
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Filter Error",
+                f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
+            )
 
     def save_recipe(self) -> None:
         if not self.data_model.history:
@@ -882,8 +1003,29 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 recipe = json.load(f)
+        except json.JSONDecodeError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Recipe Error",
+                f"Invalid JSON format in recipe file:\n{exc.msg} at line {exc.lineno}"
+            )
+            return
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(
+                self, "Recipe Error",
+                f"Recipe file not found:\n{path}"
+            )
+            return
+        except PermissionError:
+            QtWidgets.QMessageBox.warning(
+                self, "Recipe Error",
+                f"Permission denied reading recipe file:\n{path}"
+            )
+            return
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Recipe error", str(exc))
+            QtWidgets.QMessageBox.warning(
+                self, "Recipe Error",
+                f"Failed to load recipe:\n{type(exc).__name__}: {exc}"
+            )
             return
         targets = self.project_panel.selected_trials()
         if not targets and self.data_model.df is not None:
@@ -895,8 +1037,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if trial_path != "__current__":
                 try:
                     model.load_csv(trial_path)
+                except FileNotFoundError:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Load Error",
+                        f"Trial file not found:\n{trial_path}"
+                    )
+                    continue
+                except PermissionError:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Load Error",
+                        f"Permission denied reading trial:\n{trial_path}"
+                    )
+                    continue
                 except Exception as exc:
-                    QtWidgets.QMessageBox.warning(self, "Load error", f"{trial_path}: {exc}")
+                    QtWidgets.QMessageBox.warning(
+                        self, "Load Error",
+                        f"Failed to load trial {os.path.basename(trial_path)}:\n{type(exc).__name__}: {exc}"
+                    )
                     continue
             self.filter_engine.set_sample_rate(model.sample_rate)
             df = model.get_dataframe()
@@ -906,6 +1063,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 params = op.get("params", {})
                 if desc == "filter":
                     chans = params.get("channels", model.signal_columns)
+
+                    # Validate channels exist in the DataFrame
+                    missing = [c for c in chans if c not in df.columns]
+                    if missing:
+                        QtWidgets.QMessageBox.warning(
+                            self, "Recipe Warning",
+                            f"Channels not found in {os.path.basename(trial_path) if trial_path != '__current__' else 'current session'}:\n"
+                            f"{', '.join(missing)}\n\n"
+                            f"Skipping filter operation."
+                        )
+                        continue
+
                     f_params = {k: v for k, v in params.items() if k != "channels"}
                     df = self.filter_engine.apply(df, chans, f_params.get("filter_type", params.get("filter", "moving_average")), f_params)
                     op_count += 1
@@ -920,7 +1089,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 model.set_dataframe(df)
                 out_path = os.path.splitext(trial_path)[0] + "_recipe.csv"
                 model.save_clean(out_path)
-                summaries.append(f"{os.path.basename(trial_path)} → {os.path.basename(out_path)} ({op_count} ops)")
+                summaries.append(f"{os.path.basename(trial_path)} -> {os.path.basename(out_path)} ({op_count} ops)")
                 self.project.update_status(trial_path, "cleaned", f"Recipe applied ({op_count} ops)")
         if summaries:
             QtWidgets.QMessageBox.information(self, "Batch recipe summary", "\n".join(summaries))
@@ -1055,7 +1224,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_mode_changed(self, mode_id: int) -> None:
         """Handle interaction mode changes."""
-        self.interaction_mode = InteractionMode(mode_id)
+        new_mode = InteractionMode(mode_id)
+
+        # Warn if selection will be lost
+        if self.selection[0] is not None and self.selection[1] is not None:
+            if new_mode != self.interaction_mode:
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Clear Selection?",
+                    f"Switching to {new_mode.name.title()} mode will clear your current selection "
+                    f"({self.selection[0]:.3f}s - {self.selection[1]:.3f}s).\n\n"
+                    f"Continue?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.Yes  # Default Yes since mode switch is intentional
+                )
+                if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                    # Restore previous mode button state
+                    self._restore_mode_button()
+                    return
+
+        self.interaction_mode = new_mode
 
         # Reset state when switching modes
         self.selection = (None, None)
@@ -1079,6 +1267,17 @@ class MainWindow(QtWidgets.QMainWindow):
             InteractionMode.EDIT: "Edit mode: Drag annotations to adjust, Shift+drag=start only, Ctrl+drag=end only",
         }
         self.statusBar().showMessage(hints[self.interaction_mode])
+
+    def _restore_mode_button(self) -> None:
+        """Restore mode button to current interaction mode (when user cancels mode switch)."""
+        self.mode_group.blockSignals(True)
+        if self.interaction_mode == InteractionMode.TRIMMING:
+            self.trim_mode_btn.setChecked(True)
+        elif self.interaction_mode == InteractionMode.ANNOTATION:
+            self.annotate_mode_btn.setChecked(True)
+        else:
+            self.edit_mode_btn.setChecked(True)
+        self.mode_group.blockSignals(False)
 
     def set_time_cursor(self, t: float) -> None:
         self.current_time = float(t)
@@ -1253,6 +1452,24 @@ class MainWindow(QtWidgets.QMainWindow):
         sel = self._selection_values()
         if not sel:
             return
+
+        start, end = sel
+        duration = end - start
+
+        # Confirmation dialog for destructive operation
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Deletion",
+            f"Delete data segment from {start:.3f}s to {end:.3f}s ({duration:.3f}s)?\n\n"
+            f"This will permanently remove {int(duration * self.data_model.sample_rate)} samples.\n"
+            f"You can undo this operation with 'U' key.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
+        )
+
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
         self.data_model.delete_segment(*sel)
         self.selection = (None, None)
         self.plot2d.clear_selection()
@@ -1438,20 +1655,66 @@ class MainWindow(QtWidgets.QMainWindow):
         ann_id = self.ann_table.selected_annotation_id()
         if ann_id == -1:
             return
+
+        # Find annotation for confirmation message
+        ann = next((a for a in self.data_model.annotations if a.id == ann_id), None)
+        if ann is None:
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Deletion",
+            f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
+        )
+
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
         self.data_model.delete_annotation(ann_id)
 
     def delete_selected_annotation(self) -> None:
         """Delete the currently selected annotation via keyboard (Delete/Backspace)."""
         # Check if we have a plot-selected annotation first
         if self.selected_annotation_id is not None:
+            ann = next((a for a in self.data_model.annotations if a.id == self.selected_annotation_id), None)
+            if ann is None:
+                return
+
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Confirm Deletion",
+                f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
             self.data_model.delete_annotation(self.selected_annotation_id)
             self.selected_annotation_id = None
             self._on_annotations_changed()
             self.statusBar().showMessage("Annotation deleted")
             return
+
         # Fall back to table selection
         ann_id = self.ann_table.selected_annotation_id()
         if ann_id != -1:
+            ann = next((a for a in self.data_model.annotations if a.id == ann_id), None)
+            if ann is None:
+                return
+
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Confirm Deletion",
+                f"Delete annotation '{ann.label}' ({ann.start:.3f}s - {ann.end:.3f}s)?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No  # Default to No for safety
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
             self.data_model.delete_annotation(ann_id)
             self._on_annotations_changed()
             self.statusBar().showMessage("Annotation deleted")
@@ -1466,13 +1729,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if "episode_index" not in df.columns or "episode_type" not in df.columns:
             return
         types = df["episode_type"].fillna("episode").astype(str)
-        idxs = df["episode_index"].ffill().astype(int)
+        # ffill propagates episode index within episodes; NaN preserved for no-activity periods
+        idxs = df["episode_index"].ffill()
         state_col = df["episode_state"] if "episode_state" in df.columns else None
         # remove prior episode annotations
         self.data_model.annotations = [a for a in self.data_model.annotations if not a.label.startswith("episode:")]
         next_id = self.data_model._id_counter
         max_id_seen = next_id
-        for ep in idxs.unique():
+        for ep in idxs.dropna().unique():  # skip NaN (no-activity periods)
             ep_mask = idxs == ep
             start = df.loc[ep_mask, "normalized_time"].min()
             end = df.loc[ep_mask, "normalized_time"].max()
@@ -1552,8 +1816,13 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             with open(self.autosave_path, "w", encoding="utf-8") as f:
                 json.dump(state, f)
-        except Exception:
-            pass
+        except PermissionError:
+            self.statusBar().showMessage("Autosave failed: Permission denied", 5000)
+        except OSError as e:
+            self.statusBar().showMessage(f"Autosave failed: {e.strerror}", 5000)
+        except Exception as e:
+            print(f"Autosave error: {type(e).__name__}: {e}")
+            self.statusBar().showMessage("Autosave failed", 5000)
 
     def prompt_restore_autosave(self) -> None:
         if not os.path.isfile(self.autosave_path):
