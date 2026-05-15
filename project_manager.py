@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, asdict, fields
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Schema version for project files - increment when format changes
 PROJECT_SCHEMA_VERSION = 1
@@ -258,4 +258,17 @@ def save_signal_presets(presets: Dict[str, Dict]) -> None:
             raise
     except Exception as e:
         print(f"Failed to save presets: {e}")
+
+
+def load_ui_state() -> Dict[str, Any]:
+    """Load UI state (splitter positions) from signal_presets.json."""
+    presets = load_signal_presets()
+    return presets.get("__ui_state__", {})
+
+
+def save_ui_state(state: Dict[str, Any]) -> None:
+    """Save UI state to signal_presets.json under __ui_state__ key."""
+    presets = load_signal_presets()
+    presets["__ui_state__"] = state
+    save_signal_presets(presets)
 

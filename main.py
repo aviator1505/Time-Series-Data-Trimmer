@@ -110,6 +110,12 @@ def validate_plugin_expression(expr: str, available_columns: List[str]) -> Tuple
 from data_model import AnnotationSegment, DataModel, OperationRecord
 from dialogs import (
     AnnotationTable,
+    CalibrationWizard,
+    ChannelDeleteDialog,
+    ChannelDuplicateDialog,
+    ColumnRenameDialog,
+    CompareTrialsDialog,
+    DerivedChannelDialog,
     ExportCSVDialog,
     ExportFigureDialog,
     FilterPanel,
@@ -117,16 +123,15 @@ from dialogs import (
     FrameManagerDialog,
     MappingDialog,
     PreferencesDialog,
-    ShortcutDialog,
-    CompareTrialsDialog,
-    CalibrationWizard,
+    RecipePreviewDialog,
     RelativeOrientationDialog,
+    ShortcutDialog,
 )
 from filter_engine import FilterEngine
 from plot2d import PlotController2D
 from plot3d import PlotController3D
 from plugin_system import PluginManager
-from project_manager import ProjectManager, load_signal_presets, save_signal_presets
+from project_manager import ProjectManager, load_signal_presets, save_signal_presets, load_ui_state, save_ui_state
 
 
 class ChannelManagerWidget(QtWidgets.QWidget):
@@ -138,20 +143,51 @@ class ChannelManagerWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.style_panel: Optional["ChannelStylePanel"] = None  # set externally
         layout = QtWidgets.QVBoxLayout(self)
+
+        # Create splitter for resizable sections
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+
+        # Time section
+        time_widget = QtWidgets.QWidget()
+        time_layout = QtWidgets.QVBoxLayout(time_widget)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.addWidget(QtWidgets.QLabel("Time columns"))
         self.time_list = QtWidgets.QListWidget()
+        time_layout.addWidget(self.time_list)
+        self.splitter.addWidget(time_widget)
+
+        # Metadata section
+        meta_widget = QtWidgets.QWidget()
+        meta_layout = QtWidgets.QVBoxLayout(meta_widget)
+        meta_layout.setContentsMargins(0, 0, 0, 0)
+        meta_layout.addWidget(QtWidgets.QLabel("Metadata columns"))
         self.meta_list = QtWidgets.QListWidget()
+        meta_layout.addWidget(self.meta_list)
+        self.splitter.addWidget(meta_widget)
+
+        # Signals section
+        signal_widget = QtWidgets.QWidget()
+        signal_layout_inner = QtWidgets.QVBoxLayout(signal_widget)
+        signal_layout_inner.setContentsMargins(0, 0, 0, 0)
+        signal_layout_inner.addWidget(QtWidgets.QLabel("Signals"))
         self.signal_container = QtWidgets.QScrollArea()
         self.signal_container.setWidgetResizable(True)
         self.signal_widget = QtWidgets.QWidget()
         self.signal_layout = QtWidgets.QVBoxLayout(self.signal_widget)
         self.signal_layout.setContentsMargins(0, 0, 0, 0)
         self.signal_container.setWidget(self.signal_widget)
-        layout.addWidget(QtWidgets.QLabel("Time columns"))
-        layout.addWidget(self.time_list)
-        layout.addWidget(QtWidgets.QLabel("Metadata columns"))
-        layout.addWidget(self.meta_list)
-        layout.addWidget(QtWidgets.QLabel("Signals"))
-        layout.addWidget(self.signal_container, 1)
+        signal_layout_inner.addWidget(self.signal_container)
+        self.splitter.addWidget(signal_widget)
+
+        # Restore saved splitter sizes or use defaults
+        ui_state = load_ui_state()
+        sizes = ui_state.get("channel_manager_splitter", [80, 80, 300])
+        self.splitter.setSizes(sizes)
+        self.splitter.splitterMoved.connect(self._save_splitter_state)
+
+        layout.addWidget(self.splitter, 1)
+
+        # Preset controls
         self.presets_combo = QtWidgets.QComboBox()
         self.presets_combo.setEditable(True)
         self.save_preset_btn = QtWidgets.QPushButton("Save")
@@ -166,6 +202,12 @@ class ChannelManagerWidget(QtWidgets.QWidget):
         self.save_preset_btn.clicked.connect(self.save_preset)
         self.delete_preset_btn.clicked.connect(self.delete_preset)
         self.presets_combo.currentIndexChanged.connect(self.apply_preset)
+
+    def _save_splitter_state(self) -> None:
+        """Save splitter positions to UI state."""
+        ui_state = load_ui_state()
+        ui_state["channel_manager_splitter"] = self.splitter.sizes()
+        save_ui_state(ui_state)
 
     def populate(self, time_cols: List[str], meta_cols: List[str], signal_cols: Dict[str, List[str]]) -> None:
         self.time_list.clear()
@@ -649,6 +691,10 @@ class MainWindow(QtWidgets.QMainWindow):
         edit_menu.addAction("Preferences…", self.on_preferences)
         self.tools_menu = menubar.addMenu("&Tools")
         self.tools_menu.addAction("Filters…", self.on_filters)
+        self.tools_menu.addAction("Rename columns…", self.on_rename_columns)
+        self.tools_menu.addAction("Delete channels…", self.on_delete_channels)
+        self.tools_menu.addAction("Duplicate channels…", self.on_duplicate_channels)
+        self.tools_menu.addAction("Create derived channel…", self.on_derived_channel)
         self.tools_menu.addAction("Coordinate frames…", self.on_frames)
         self.tools_menu.addAction("3D mapping…", self.on_mapping)
         self.tools_menu.addAction("Derived frame transform…", self.on_frame_transform)
@@ -1090,6 +1136,178 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filter_dock.show()
             self.filter_dock.raise_()
 
+    def on_rename_columns(self) -> None:
+        """Open column rename dialog."""
+        if self.data_model.df is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Data", "Load a CSV file first."
+            )
+            return
+
+        # Get columns excluding system columns
+        all_cols = list(self.data_model.df.columns)
+        exclude = {"normalized_time", "is_bad_segment"}
+        cols_to_rename = [c for c in all_cols if c not in exclude]
+
+        if not cols_to_rename:
+            QtWidgets.QMessageBox.information(
+                self, "No Columns", "No renameable columns found."
+            )
+            return
+
+        dlg = ColumnRenameDialog(cols_to_rename, self)
+        if not dlg.exec():
+            return
+
+        mappings = dlg.get_mappings()
+        if not mappings:
+            self.statusBar().showMessage("No columns renamed")
+            return
+
+        self.data_model.rename_channels(mappings)
+
+        # Refresh UI
+        self.channel_manager.populate(
+            self.data_model.time_columns,
+            self.data_model.metadata_columns,
+            self.data_model.channel_groups()
+        )
+        self.plot2d.refresh_plots()
+        self.statusBar().showMessage(f"Renamed {len(mappings)} column(s)")
+
+    def on_delete_channels(self) -> None:
+        """Open channel delete dialog."""
+        if self.data_model.df is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Data", "Load a CSV file first."
+            )
+            return
+
+        # Get columns excluding system columns
+        all_cols = list(self.data_model.df.columns)
+        exclude = {"normalized_time", "is_bad_segment"}
+        cols_to_delete = [c for c in all_cols if c not in exclude]
+
+        if not cols_to_delete:
+            QtWidgets.QMessageBox.information(
+                self, "No Columns", "No deletable columns found."
+            )
+            return
+
+        dlg = ChannelDeleteDialog(cols_to_delete, self)
+        if not dlg.exec():
+            return
+
+        selected = dlg.get_selected_columns()
+        if not selected:
+            self.statusBar().showMessage("No channels deleted")
+            return
+
+        self.data_model.delete_channels(selected)
+
+        # Refresh UI
+        self.channel_manager.populate(
+            self.data_model.time_columns,
+            self.data_model.metadata_columns,
+            self.data_model.channel_groups()
+        )
+        self.plot2d.refresh_plots()
+        self.statusBar().showMessage(f"Deleted {len(selected)} channel(s)")
+
+    def on_duplicate_channels(self) -> None:
+        """Open channel duplicate dialog."""
+        if self.data_model.df is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Data", "Load a CSV file first."
+            )
+            return
+
+        # Get columns excluding system columns
+        all_cols = list(self.data_model.df.columns)
+        exclude = {"normalized_time", "is_bad_segment"}
+        cols_to_dup = [c for c in all_cols if c not in exclude]
+
+        if not cols_to_dup:
+            QtWidgets.QMessageBox.information(
+                self, "No Columns", "No columns available to duplicate."
+            )
+            return
+
+        dlg = ChannelDuplicateDialog(cols_to_dup, all_cols, self)
+        if not dlg.exec():
+            return
+
+        mappings = dlg.get_mappings()
+        if not mappings:
+            self.statusBar().showMessage("No channels duplicated")
+            return
+
+        self.data_model.duplicate_channels(mappings)
+
+        # Refresh UI
+        self.channel_manager.populate(
+            self.data_model.time_columns,
+            self.data_model.metadata_columns,
+            self.data_model.channel_groups()
+        )
+        self.plot2d.refresh_plots()
+        self.statusBar().showMessage(f"Duplicated {len(mappings)} channel(s)")
+
+    def on_derived_channel(self) -> None:
+        """Open derived channel dialog."""
+        if self.data_model.df is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Data", "Load a CSV file first."
+            )
+            return
+
+        # Get columns for expression building
+        all_cols = list(self.data_model.df.columns)
+        exclude = {"is_bad_segment"}
+        available_cols = [c for c in all_cols if c not in exclude]
+
+        if not available_cols:
+            QtWidgets.QMessageBox.information(
+                self, "No Columns", "No columns available for expressions."
+            )
+            return
+
+        dlg = DerivedChannelDialog(available_cols, self.data_model.df, all_cols, self)
+        if not dlg.exec():
+            return
+
+        params = dlg.get_params()
+        if not params.get("name") or not params.get("expr"):
+            self.statusBar().showMessage("No derived channel created")
+            return
+
+        # Validate expression for security
+        is_valid, error = validate_plugin_expression(params["expr"], available_cols)
+        if not is_valid:
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Expression",
+                f"Expression validation failed:\n{error}"
+            )
+            return
+
+        try:
+            self.data_model.create_derived_channel(params["name"], params["expr"])
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Error",
+                f"Failed to create derived channel:\n{e}"
+            )
+            return
+
+        # Refresh UI
+        self.channel_manager.populate(
+            self.data_model.time_columns,
+            self.data_model.metadata_columns,
+            self.data_model.channel_groups()
+        )
+        self.plot2d.refresh_plots()
+        self.statusBar().showMessage(f"Created derived channel '{params['name']}'")
+
     def apply_filters_from_panel(self, preview: bool = False) -> None:
         if self.data_model.df is None:
             return
@@ -1197,11 +1415,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Recipe saved to {path}")
 
     def apply_recipe_to_trials(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open recipe", "", "JSON files (*.json)")
-        if not path:
+        """Apply a recipe to trials with preview and custom output paths."""
+        recipe_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open recipe", "", "JSON files (*.json)")
+        if not recipe_path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(recipe_path, "r", encoding="utf-8") as f:
                 recipe = json.load(f)
         except json.JSONDecodeError as exc:
             QtWidgets.QMessageBox.warning(
@@ -1212,13 +1431,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except FileNotFoundError:
             QtWidgets.QMessageBox.warning(
                 self, "Recipe Error",
-                f"Recipe file not found:\n{path}"
+                f"Recipe file not found:\n{recipe_path}"
             )
             return
         except PermissionError:
             QtWidgets.QMessageBox.warning(
                 self, "Recipe Error",
-                f"Permission denied reading recipe file:\n{path}"
+                f"Permission denied reading recipe file:\n{recipe_path}"
             )
             return
         except Exception as exc:
@@ -1227,14 +1446,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Failed to load recipe:\n{type(exc).__name__}: {exc}"
             )
             return
+
         targets = self.project_panel.selected_trials()
         if not targets and self.data_model.df is not None:
-            # apply to current only
             targets = ["__current__"]
-        summaries: List[str] = []
-        for trial_path in targets:
-            model = self.data_model if trial_path == "__current__" else DataModel()
-            if trial_path != "__current__":
+
+        if not targets:
+            QtWidgets.QMessageBox.information(
+                self, "No Targets",
+                "No trials selected and no data loaded."
+            )
+            return
+
+        # Phase 1: Pre-process all trials without saving
+        trial_results: List[Dict] = []
+        progress = QtWidgets.QProgressDialog(
+            "Processing trials...", "Cancel", 0, len(targets), self
+        )
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+
+        recipe_name = os.path.splitext(os.path.basename(recipe_path))[0]
+
+        for i, trial_path in enumerate(targets):
+            if progress.wasCanceled():
+                self.statusBar().showMessage("Recipe application cancelled")
+                return
+            progress.setValue(i)
+            progress.setLabelText(f"Processing {os.path.basename(trial_path) if trial_path != '__current__' else 'current session'}...")
+
+            is_current = trial_path == "__current__"
+            model = self.data_model if is_current else DataModel()
+
+            if not is_current:
                 try:
                     model.load_csv(trial_path)
                 except FileNotFoundError:
@@ -1255,24 +1498,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Failed to load trial {os.path.basename(trial_path)}:\n{type(exc).__name__}: {exc}"
                     )
                     continue
+
             self.filter_engine.set_sample_rate(model.sample_rate)
-            df = model.get_dataframe()
+            # For current session, store original for preview (can't reload from file)
+            # For file trials, we'll reload on-demand to save memory
+            original_df = model.get_dataframe().copy() if is_current else None
+            df = model.get_dataframe().copy()  # Work on copy to avoid mutating original
             op_count = 0
-            skipped_ops: List[str] = []  # Track skipped operations
+            skipped_ops: List[str] = []
 
             for op in recipe.get("operations", []):
                 desc = op.get("description")
                 params = op.get("params", {})
                 if desc == "filter":
                     chans = params.get("channels", model.signal_columns)
-
-                    # Validate channels exist in the DataFrame
                     missing = [c for c in chans if c not in df.columns]
                     if missing:
                         filter_type = params.get("filter_type", params.get("filter", "unknown"))
                         skipped_ops.append(f"filter ({filter_type}): missing channels {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}")
                         continue
-
                     f_params = {k: v for k, v in params.items() if k != "channels"}
                     try:
                         df = self.filter_engine.apply(df, chans, f_params.get("filter_type", params.get("filter", "moving_average")), f_params)
@@ -1280,14 +1524,93 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception as e:
                         skipped_ops.append(f"filter: {type(e).__name__} - {str(e)[:50]}")
 
+                elif desc == "rename":
+                    mappings = params.get("mappings", {})
+                    if not mappings:
+                        continue
+                    # Validate source columns exist
+                    missing = [col for col in mappings.keys() if col not in df.columns]
+                    if missing:
+                        skipped_ops.append(f"rename: missing columns {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}")
+                        continue
+                    try:
+                        df = df.rename(columns=mappings)
+                        # Update model's column tracking
+                        for old, new in mappings.items():
+                            if old in model.signal_columns:
+                                idx = model.signal_columns.index(old)
+                                model.signal_columns[idx] = new
+                            elif old in model.time_columns:
+                                idx = model.time_columns.index(old)
+                                model.time_columns[idx] = new
+                            elif old in model.metadata_columns:
+                                idx = model.metadata_columns.index(old)
+                                model.metadata_columns[idx] = new
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"rename: {type(e).__name__}")
+
+                elif desc == "delete_channels":
+                    columns = params.get("columns", [])
+                    if not columns:
+                        continue
+                    # Only delete columns that exist
+                    existing = [c for c in columns if c in df.columns]
+                    if not existing:
+                        skipped_ops.append("delete_channels: no matching columns")
+                        continue
+                    try:
+                        df = df.drop(columns=existing)
+                        # Update model tracking lists
+                        model.signal_columns = [c for c in model.signal_columns if c not in existing]
+                        model.metadata_columns = [c for c in model.metadata_columns if c not in existing]
+                        model.time_columns = [c for c in model.time_columns if c not in existing]
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"delete_channels: {type(e).__name__}")
+
+                elif desc == "duplicate_channels":
+                    mappings = params.get("mappings", {})
+                    if not mappings:
+                        continue
+                    missing = [s for s in mappings.keys() if s not in df.columns]
+                    if missing:
+                        skipped_ops.append(f"duplicate_channels: missing {', '.join(missing[:3])}")
+                        continue
+                    try:
+                        for source, new_name in mappings.items():
+                            df[new_name] = df[source].copy()
+                            if source in model.signal_columns:
+                                model.signal_columns.append(new_name)
+                            elif source in model.metadata_columns:
+                                model.metadata_columns.append(new_name)
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"duplicate_channels: {type(e).__name__}")
+
+                elif desc == "derived":
+                    name = params.get("name")
+                    expr = params.get("expr")
+                    if not name or not expr:
+                        continue
+                    is_valid, error = validate_plugin_expression(expr, list(df.columns))
+                    if not is_valid:
+                        skipped_ops.append(f"derived ({name}): {error[:30]}")
+                        continue
+                    try:
+                        df[name] = pd.eval(expr, local_dict=df.to_dict("series"))
+                        if name not in model.signal_columns:
+                            model.signal_columns.append(name)
+                        op_count += 1
+                    except Exception as e:
+                        skipped_ops.append(f"derived ({name}): {type(e).__name__}")
+
                 elif desc and desc.startswith("plugin:"):
                     plugin_name = desc.split(":", 1)[1]
-                    # Use _apply_plugin_to_df to apply to batch DataFrame, not self.data_model
                     try:
                         df, new_cols = self._apply_plugin_to_df(
-                            plugin_name, df, model.signal_columns, show_warnings=False  # Don't show per-op warnings
+                            plugin_name, df, model.signal_columns, show_warnings=False
                         )
-                        # Track new columns for this model
                         for col in new_cols:
                             if col not in model.signal_columns:
                                 model.signal_columns.append(col)
@@ -1295,26 +1618,65 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception as e:
                         skipped_ops.append(f"plugin ({plugin_name}): {type(e).__name__}")
 
+            # Compute default output path
+            if is_current:
+                default_output = "(current session)"
+            else:
+                default_output = os.path.splitext(trial_path)[0] + f"_{recipe_name}.csv"
+
+            result_entry = {
+                "path": trial_path,
+                "processed_df": df,
+                "model": model,
+                "signal_columns": list(model.signal_columns),
+                "op_count": op_count,
+                "skipped_ops": skipped_ops,
+                "default_output": default_output,
+            }
+            # Only store original_df for current session (can't reload from file)
+            if original_df is not None:
+                result_entry["original_df"] = original_df
+            trial_results.append(result_entry)
+
+        progress.setValue(len(targets))
+
+        if not trial_results:
+            self.statusBar().showMessage("No trials processed")
+            return
+
+        # Phase 2: Show preview dialog
+        preview_dialog = RecipePreviewDialog(recipe_name, trial_results, self)
+        if not preview_dialog.exec():
+            self.statusBar().showMessage("Recipe application cancelled")
+            return
+
+        # Phase 3: Save selected trials with custom paths
+        selected = preview_dialog.get_selected_trials()
+        summaries: List[str] = []
+
+        for result in selected:
+            trial_path = result["path"]
+            out_path = result["output_path"]
+            model = result["model"]
+            df = result["processed_df"]
+            op_count = result["op_count"]
+            skipped_ops = result.get("skipped_ops", [])
+
             trial_name = os.path.basename(trial_path) if trial_path != "__current__" else "current session"
+
             if trial_path == "__current__":
-                model.apply_dataframe(df, "recipe", 0.0, df["normalized_time"].max(), {"recipe": os.path.basename(path)})
+                model.apply_dataframe(df, "recipe", 0.0, df["normalized_time"].max(), {"recipe": recipe_name})
                 summary = f"Current session: {op_count} ops applied"
             else:
                 model.set_dataframe(df)
-                out_path = os.path.splitext(trial_path)[0] + "_recipe.csv"
                 model.save_clean(out_path)
                 summary = f"{trial_name} -> {os.path.basename(out_path)} ({op_count} ops)"
                 self.project.update_status(trial_path, "cleaned", f"Recipe applied ({op_count} ops)")
 
-            # Add skipped operations to summary
             if skipped_ops:
                 summary += f", {len(skipped_ops)} skipped"
             summaries.append(summary)
 
-            # Collect all skipped operations for warning
-            if skipped_ops:
-                for skip_msg in skipped_ops[:5]:  # Limit to first 5
-                    summaries.append(f"  ⚠ {skip_msg}")
         if summaries:
             QtWidgets.QMessageBox.information(self, "Batch recipe summary", "\n".join(summaries))
         self.project_panel.refresh()

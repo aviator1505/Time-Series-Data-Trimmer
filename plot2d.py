@@ -622,6 +622,7 @@ class PlotController2D:
                 symbolPen=pg.mkPen(color=color, width=0.8),
                 symbolBrush=pg.mkBrush(color),
                 name=name,
+                stepMode=False,  # pyqtgraph 0.14.0 bug workaround
             )
         elif style == "area":
             plot.plot(
@@ -631,6 +632,7 @@ class PlotController2D:
                 brush=pg.mkBrush(color[0], color[1], color[2], 80),
                 fillLevel=0,
                 name=name,
+                stepMode=False,  # pyqtgraph 0.14.0 bug workaround
             )
         else:  # line
             # Note: stepMode=False required to work around pyqtgraph 0.14.0 bug
@@ -665,6 +667,7 @@ class PlotController2D:
                         vals[mask],
                         pen=pg.mkPen((color[0], color[1], color[2], 180), width=1.0),
                         name=ch if idx == 0 else None,
+                        stepMode=False,  # pyqtgraph 0.14.0 bug workaround
                     )
             self._style_axes(p)
             self.plots.append(p)
@@ -687,6 +690,7 @@ class PlotController2D:
                         t_mod[mask],
                         vals[mask],
                         pen=pg.mkPen((color[0], color[1], color[2], 180), width=1.0),
+                        stepMode=False,  # pyqtgraph 0.14.0 bug workaround
                     )
                 if row > 0 and self.plots:
                     p.setXLink(self.plots[0])

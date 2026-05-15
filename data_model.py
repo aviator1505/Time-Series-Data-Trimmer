@@ -689,6 +689,141 @@ class DataModel(QtCore.QObject):
         self.dataChanged.emit()
         self.historyChanged.emit()
 
+    def rename_channels(self, mappings: Dict[str, str]) -> None:
+        """Rename columns in DataFrame and update tracking lists.
+
+        Args:
+            mappings: Dict of {old_name: new_name}
+        """
+        if not mappings or self.df is None:
+            return
+
+        self._push_state()
+
+        # Apply rename to DataFrame
+        self.df.rename(columns=mappings, inplace=True)
+
+        # Update column tracking lists (preserve order)
+        for old_col, new_col in mappings.items():
+            if old_col in self.time_columns:
+                idx = self.time_columns.index(old_col)
+                self.time_columns[idx] = new_col
+            elif old_col in self.metadata_columns:
+                idx = self.metadata_columns.index(old_col)
+                self.metadata_columns[idx] = new_col
+            elif old_col in self.signal_columns:
+                idx = self.signal_columns.index(old_col)
+                self.signal_columns[idx] = new_col
+
+        # Record in history for recipe generation
+        end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
+        self.history.append(OperationRecord(
+            "rename",
+            {"mappings": mappings},
+            0.0,
+            end_time
+        ))
+
+        self.dataChanged.emit()
+        self.historyChanged.emit()
+
+    def delete_channels(self, columns: List[str]) -> None:
+        """Delete columns from DataFrame and tracking lists.
+
+        Args:
+            columns: List of column names to delete
+        """
+        if not columns or self.df is None:
+            return
+
+        self._push_state()
+
+        # Remove columns from DataFrame (only those that exist)
+        cols_to_drop = [c for c in columns if c in self.df.columns]
+        if cols_to_drop:
+            self.df = self.df.drop(columns=cols_to_drop)
+
+        # Update tracking lists
+        self.signal_columns = [c for c in self.signal_columns if c not in columns]
+        self.metadata_columns = [c for c in self.metadata_columns if c not in columns]
+        self.time_columns = [c for c in self.time_columns if c not in columns]
+
+        # Record in history
+        end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
+        self.history.append(OperationRecord(
+            "delete_channels",
+            {"columns": columns},
+            0.0,
+            end_time
+        ))
+
+        self.dataChanged.emit()
+        self.historyChanged.emit()
+
+    def duplicate_channels(self, mappings: Dict[str, str]) -> None:
+        """Duplicate columns with new names.
+
+        Args:
+            mappings: Dict of {source_col: new_col_name}
+        """
+        if not mappings or self.df is None:
+            return
+
+        self._push_state()
+
+        # Copy each column
+        for source, new_name in mappings.items():
+            if source in self.df.columns:
+                self.df[new_name] = self.df[source].copy()
+                # Add to appropriate tracking list
+                if source in self.signal_columns:
+                    self.signal_columns.append(new_name)
+                elif source in self.metadata_columns:
+                    self.metadata_columns.append(new_name)
+
+        # Record in history
+        end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
+        self.history.append(OperationRecord(
+            "duplicate_channels",
+            {"mappings": mappings},
+            0.0,
+            end_time
+        ))
+
+        self.dataChanged.emit()
+        self.historyChanged.emit()
+
+    def create_derived_channel(self, name: str, expr: str) -> None:
+        """Create a new channel from an expression.
+
+        Args:
+            name: Name for the new channel
+            expr: pd.eval() compatible expression referencing existing columns
+        """
+        if not name or not expr or self.df is None:
+            return
+
+        self._push_state()
+
+        # Evaluate expression
+        self.df[name] = pd.eval(expr, local_dict=self.df.to_dict("series"))
+
+        # Add to signal columns (derived channels are always numeric)
+        if name not in self.signal_columns:
+            self.signal_columns.append(name)
+
+        # Record in history
+        end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
+        self.history.append(OperationRecord(
+            "derived",
+            {"name": name, "expr": expr},
+            0.0,
+            end_time
+        ))
+
+        self.dataChanged.emit()
+        self.historyChanged.emit()
+
     def set_sample_rate(self, fs: float, recalculate_time: bool = False) -> None:
         """Set the sample rate.
 

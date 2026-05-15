@@ -1,0 +1,12 @@
+{
+  "Annotation_Guides": {
+    "channels": [
+      "gaze_heading_deg",
+      "gaze_heading_deg_raw",
+      "head_heading_deg"
+    ],
+    "styles": {
+      "gaze_heading_deg_raw": "scatter"
+    }
+  }
+}

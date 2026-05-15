@@ -11,6 +11,7 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 
 from data_model import AnnotationSegment
 from filter_engine import available_filters
+from project_manager import load_ui_state, save_ui_state
 
 
 FILTER_PARAM_MAP: Dict[str, List[str]] = {
@@ -31,6 +32,8 @@ FILTER_PARAM_MAP: Dict[str, List[str]] = {
     "invert_polarity": [],
     "invert_mean": [],
     "invert_reference": ["reference"],
+    "mirror": ["mirror_mode"],
+    "circular_flip": ["wrap_mode"],
     "constant_offset": ["offset"],
 }
 
@@ -52,10 +55,16 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
     "invert_polarity": "Negate all values in the signal (-x).",
     "invert_mean": "Flip values around the channel mean (2*mean - x).",
     "invert_reference": "Flip values around a specified reference point (2*ref - x).",
+    "mirror": "Flip values around a computed reference: midpoint, median, max, or min of the signal.",
+    "circular_flip": "Flip heading/orientation by 180° with circular wrapping (0°→180°, 180°→0°).",
     "constant_offset": "Add/subtract a constant value (e.g., +180 to shift angles).",
 }
 
 INTERPOLATE_METHODS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
+
+MIRROR_MODES = ["midpoint", "median", "max", "min", "first"]
+
+WRAP_MODES = ["signed", "unsigned"]
 
 
 class NumericTableItem(QtWidgets.QTableWidgetItem):
@@ -142,6 +151,12 @@ class FilterDialog(QtWidgets.QDialog):
         self.reference_spin.setDecimals(4)
         self.reference_spin.setValue(0.0)
         self._add_param_row(form, "Reference value", self.reference_spin, "reference")
+        self.mirror_mode_combo = QtWidgets.QComboBox()
+        self.mirror_mode_combo.addItems(MIRROR_MODES)
+        self._add_param_row(form, "Mirror around", self.mirror_mode_combo, "mirror_mode")
+        self.wrap_mode_combo = QtWidgets.QComboBox()
+        self.wrap_mode_combo.addItems(WRAP_MODES)
+        self._add_param_row(form, "Output range", self.wrap_mode_combo, "wrap_mode")
         self.offset_spin = QtWidgets.QDoubleSpinBox()
         self.offset_spin.setRange(-1e9, 1e9)
         self.offset_spin.setDecimals(4)
@@ -284,6 +299,10 @@ class FilterDialog(QtWidgets.QDialog):
             return self.method_combo.currentText()
         if key == "reference":
             return self.reference_spin.value()
+        if key == "mirror_mode":
+            return self.mirror_mode_combo.currentText()
+        if key == "wrap_mode":
+            return self.wrap_mode_combo.currentText()
         if key == "offset":
             return self.offset_spin.value()
         return None
@@ -312,18 +331,32 @@ class FilterPanel(QtWidgets.QWidget):
     def __init__(self, channels: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("Filters"))
+
+        # Create splitter for resizable sections
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+
+        # Channel list section
+        list_widget_container = QtWidgets.QWidget()
+        list_layout = QtWidgets.QVBoxLayout(list_widget_container)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.addWidget(QtWidgets.QLabel("Channels"))
         self.list_widget = QtWidgets.QListWidget()
         self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
-        layout.addWidget(self.list_widget)
+        list_layout.addWidget(self.list_widget)
         btn_row = QtWidgets.QHBoxLayout()
         self.select_all_btn = QtWidgets.QPushButton("Select all")
         self.unselect_all_btn = QtWidgets.QPushButton("Unselect all")
         btn_row.addWidget(self.select_all_btn)
         btn_row.addWidget(self.unselect_all_btn)
-        layout.addLayout(btn_row)
-        self.set_channels(channels)
-        layout.addWidget(QtWidgets.QLabel("Preset"))
+        list_layout.addLayout(btn_row)
+        self.splitter.addWidget(list_widget_container)
+
+        # Filter controls section
+        form_widget_container = QtWidgets.QWidget()
+        form_layout_outer = QtWidgets.QVBoxLayout(form_widget_container)
+        form_layout_outer.setContentsMargins(0, 0, 0, 0)
+        form_layout_outer.addWidget(QtWidgets.QLabel("Filter Settings"))
+        form_layout_outer.addWidget(QtWidgets.QLabel("Preset"))
         self.preset_combo = QtWidgets.QComboBox()
         self.preset_combo.addItems(
             [
@@ -334,7 +367,7 @@ class FilterPanel(QtWidgets.QWidget):
                 "Normalize z-score",
             ]
         )
-        layout.addWidget(self.preset_combo)
+        form_layout_outer.addWidget(self.preset_combo)
         form = QtWidgets.QFormLayout()
         self.filter_combo = QtWidgets.QComboBox()
         self.filter_combo.addItems(available_filters())
@@ -378,24 +411,42 @@ class FilterPanel(QtWidgets.QWidget):
         self.reference_spin.setDecimals(4)
         self.reference_spin.setValue(0.0)
         self._add_param_row(form, "Reference value", self.reference_spin, "reference")
+        self.mirror_mode_combo = QtWidgets.QComboBox()
+        self.mirror_mode_combo.addItems(MIRROR_MODES)
+        self._add_param_row(form, "Mirror around", self.mirror_mode_combo, "mirror_mode")
+        self.wrap_mode_combo = QtWidgets.QComboBox()
+        self.wrap_mode_combo.addItems(WRAP_MODES)
+        self._add_param_row(form, "Output range", self.wrap_mode_combo, "wrap_mode")
         self.offset_spin = QtWidgets.QDoubleSpinBox()
         self.offset_spin.setRange(-1e9, 1e9)
         self.offset_spin.setDecimals(4)
         self.offset_spin.setValue(0.0)
         self._add_param_row(form, "Offset value", self.offset_spin, "offset")
-        layout.addLayout(form)
+        form_layout_outer.addLayout(form)
         self.filter_help = QtWidgets.QLabel()
         self.filter_help.setWordWrap(True)
-        layout.addWidget(self.filter_help)
+        form_layout_outer.addWidget(self.filter_help)
         self.apply_selection_chk = QtWidgets.QCheckBox("Only apply to current selection")
-        layout.addWidget(self.apply_selection_chk)
+        form_layout_outer.addWidget(self.apply_selection_chk)
         btns = QtWidgets.QHBoxLayout()
         self.preview_btn = QtWidgets.QPushButton("Preview")
         self.apply_btn = QtWidgets.QPushButton("Apply")
         btns.addWidget(self.preview_btn)
         btns.addWidget(self.apply_btn)
-        layout.addLayout(btns)
-        layout.addStretch(1)
+        form_layout_outer.addLayout(btns)
+        form_layout_outer.addStretch(1)
+        self.splitter.addWidget(form_widget_container)
+
+        # Restore saved splitter sizes or use defaults
+        ui_state = load_ui_state()
+        sizes = ui_state.get("filter_panel_splitter", [200, 300])
+        self.splitter.setSizes(sizes)
+        self.splitter.splitterMoved.connect(self._save_splitter_state)
+
+        layout.addWidget(self.splitter, 1)
+
+        # Initialize channels and connections
+        self.set_channels(channels)
         self.preview_btn.clicked.connect(self.previewRequested.emit)
         self.apply_btn.clicked.connect(self.applyRequested.emit)
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
@@ -410,6 +461,12 @@ class FilterPanel(QtWidgets.QWidget):
         # Ctrl+P to preview filter
         preview_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
         preview_shortcut.activated.connect(self.previewRequested.emit)
+
+    def _save_splitter_state(self) -> None:
+        """Save splitter positions to UI state."""
+        ui_state = load_ui_state()
+        ui_state["filter_panel_splitter"] = self.splitter.sizes()
+        save_ui_state(ui_state)
 
     def set_channels(self, channels: List[str]) -> None:
         self.list_widget.clear()
@@ -566,6 +623,10 @@ class FilterPanel(QtWidgets.QWidget):
             return self.method_combo.currentText()
         if key == "reference":
             return self.reference_spin.value()
+        if key == "mirror_mode":
+            return self.mirror_mode_combo.currentText()
+        if key == "wrap_mode":
+            return self.wrap_mode_combo.currentText()
         if key == "offset":
             return self.offset_spin.value()
         return None
@@ -2712,3 +2773,988 @@ class RelativeOrientationDialog(QtWidgets.QDialog):
                 },
             }
 
+
+# ---------------------------------------------------------------------------
+# Recipe Preview Dialogs
+# ---------------------------------------------------------------------------
+
+
+class RecipeDataPreviewDialog(QtWidgets.QDialog):
+    """Show before/after comparison for a single trial after recipe application.
+
+    Similar to FilterPreviewDialog but with channel selection and statistics.
+    """
+
+    def __init__(
+        self,
+        trial_name: str,
+        original_df: pd.DataFrame,
+        processed_df: pd.DataFrame,
+        signal_columns: List[str],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Recipe Preview: {trial_name}")
+        self.resize(800, 500)
+
+        self.original_df = original_df
+        self.processed_df = processed_df
+        self.signal_columns = [c for c in signal_columns if c in original_df.columns and c in processed_df.columns]
+
+        self._setup_ui()
+        if self.signal_columns:
+            self._update_plot(self.signal_columns[0])
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Channel selector
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.addWidget(QtWidgets.QLabel("Channel:"))
+        self.channel_combo = QtWidgets.QComboBox()
+        self.channel_combo.addItems(self.signal_columns)
+        self.channel_combo.currentTextChanged.connect(self._update_plot)
+        top_row.addWidget(self.channel_combo, 1)
+        layout.addLayout(top_row)
+
+        # Plot widget
+        self.plot = pg.PlotWidget()
+        legend = self.plot.addLegend()
+        try:
+            legend.setLabelTextColor((255, 255, 255))
+        except Exception:
+            pass
+        layout.addWidget(self.plot, 1)
+
+        # Statistics panel
+        self.stats_label = QtWidgets.QLabel()
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+        # Close button
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _update_plot(self, channel: str) -> None:
+        """Update plot and statistics for selected channel."""
+        self.plot.clear()
+
+        if channel not in self.original_df.columns or channel not in self.processed_df.columns:
+            return
+
+        # Get time column
+        time_col = "normalized_time" if "normalized_time" in self.original_df.columns else None
+        if time_col is None:
+            for col in self.original_df.columns:
+                if "time" in col.lower():
+                    time_col = col
+                    break
+
+        if time_col:
+            orig_time = self.original_df[time_col].values
+            proc_time = self.processed_df[time_col].values
+        else:
+            orig_time = np.arange(len(self.original_df))
+            proc_time = np.arange(len(self.processed_df))
+
+        orig_data = self.original_df[channel].values
+        proc_data = self.processed_df[channel].values
+
+        # Plot
+        self.plot.plot(orig_time, orig_data, pen=pg.mkPen('r', width=1), name="Original")
+        self.plot.plot(proc_time, proc_data, pen=pg.mkPen('g', width=1), name="Processed")
+
+        # Calculate statistics
+        orig_valid = orig_data[~np.isnan(orig_data)]
+        proc_valid = proc_data[~np.isnan(proc_data)]
+
+        stats_parts = []
+        if len(orig_valid) > 0 and len(proc_valid) > 0:
+            orig_mean = np.mean(orig_valid)
+            proc_mean = np.mean(proc_valid)
+            orig_std = np.std(orig_valid)
+            proc_std = np.std(proc_valid)
+
+            stats_parts.append(f"Original: mean={orig_mean:.4f}, std={orig_std:.4f}")
+            stats_parts.append(f"Processed: mean={proc_mean:.4f}, std={proc_std:.4f}")
+            stats_parts.append(f"Mean change: {proc_mean - orig_mean:+.4f}")
+
+        orig_nan = np.sum(np.isnan(orig_data))
+        proc_nan = np.sum(np.isnan(proc_data))
+        if orig_nan > 0 or proc_nan > 0:
+            stats_parts.append(f"NaN count: {orig_nan} -> {proc_nan}")
+
+        self.stats_label.setText(" | ".join(stats_parts) if stats_parts else "No statistics available")
+
+
+class RecipePreviewDialog(QtWidgets.QDialog):
+    """Preview recipe results before saving with custom output paths.
+
+    Features:
+    - Checkboxes for selective trial inclusion
+    - Editable output paths with pattern support
+    - Preview data button for before/after visualization
+    - Validation for duplicate/existing paths
+    """
+
+    def __init__(
+        self,
+        recipe_name: str,
+        trial_results: List[Dict],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        """
+        Args:
+            recipe_name: Name of the recipe file (without extension)
+            trial_results: List of dicts with keys:
+                - path: Original trial path (or "__current__")
+                - original_df: DataFrame before recipe
+                - processed_df: DataFrame after recipe
+                - signal_columns: List of signal column names
+                - op_count: Number of operations applied
+                - skipped_ops: List of skipped operation descriptions
+                - default_output: Default output path
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Recipe Preview")
+        self.resize(900, 500)
+
+        self.recipe_name = recipe_name
+        self.trial_results = trial_results
+        self._manually_edited: set = set()  # Track rows with manual path edits
+
+        self._setup_ui()
+        self._populate_table()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Header info
+        header = QtWidgets.QLabel(f"<b>Recipe:</b> {self.recipe_name}.json")
+        layout.addWidget(header)
+
+        # Pattern row
+        pattern_row = QtWidgets.QHBoxLayout()
+        pattern_row.addWidget(QtWidgets.QLabel("Output suffix:"))
+        self.pattern_edit = QtWidgets.QLineEdit()
+        self.pattern_edit.setText(f"_{self.recipe_name}")
+        self.pattern_edit.setPlaceholderText("e.g., _cleaned or _{recipe}")
+        self.pattern_edit.setToolTip(
+            "Suffix added to original filename.\n"
+            "Use {recipe} for recipe name, {original} for original filename."
+        )
+        self.pattern_edit.textChanged.connect(self._on_pattern_changed)
+        pattern_row.addWidget(self.pattern_edit, 1)
+
+        self.apply_pattern_btn = QtWidgets.QPushButton("Apply to All")
+        self.apply_pattern_btn.clicked.connect(self._apply_pattern_to_all)
+        pattern_row.addWidget(self.apply_pattern_btn)
+        layout.addLayout(pattern_row)
+
+        # Trial table
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([
+            "", "Trial", "Ops", "Skipped", "Output Path"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 30)
+        self.table.setColumnWidth(1, 200)
+        self.table.setColumnWidth(2, 50)
+        self.table.setColumnWidth(3, 70)
+        self.table.setSelectionBehavior(QtWidgets.QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table, 1)
+
+        # Button row
+        btn_row = QtWidgets.QHBoxLayout()
+
+        self.preview_btn = QtWidgets.QPushButton("Preview Data...")
+        self.preview_btn.clicked.connect(self._on_preview_data)
+        btn_row.addWidget(self.preview_btn)
+
+        self.select_all_btn = QtWidgets.QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self._select_all)
+        btn_row.addWidget(self.select_all_btn)
+
+        self.select_none_btn = QtWidgets.QPushButton("Select None")
+        self.select_none_btn.clicked.connect(self._select_none)
+        btn_row.addWidget(self.select_none_btn)
+
+        btn_row.addStretch()
+
+        # Dialog buttons
+        self.apply_btn = QtWidgets.QPushButton("Apply")
+        self.apply_btn.setDefault(True)
+        self.apply_btn.clicked.connect(self._validate_and_accept)
+        btn_row.addWidget(self.apply_btn)
+
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _populate_table(self) -> None:
+        """Populate table with trial results."""
+        import os
+
+        self.table.setRowCount(len(self.trial_results))
+
+        for row, result in enumerate(self.trial_results):
+            trial_path = result["path"]
+            is_current = trial_path == "__current__"
+
+            # Checkbox
+            chk = QtWidgets.QCheckBox()
+            chk.setChecked(True)
+            chk_widget = QtWidgets.QWidget()
+            chk_layout = QtWidgets.QHBoxLayout(chk_widget)
+            chk_layout.addWidget(chk)
+            chk_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            chk_layout.setContentsMargins(0, 0, 0, 0)
+            self.table.setCellWidget(row, 0, chk_widget)
+
+            # Trial name
+            trial_name = "(current session)" if is_current else os.path.basename(trial_path)
+            name_item = QtWidgets.QTableWidgetItem(trial_name)
+            name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 1, name_item)
+
+            # Operation count
+            op_item = QtWidgets.QTableWidgetItem(str(result["op_count"]))
+            op_item.setFlags(op_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            op_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 2, op_item)
+
+            # Skipped count with tooltip
+            skipped = result.get("skipped_ops", [])
+            skip_item = QtWidgets.QTableWidgetItem(str(len(skipped)))
+            skip_item.setFlags(skip_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            skip_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if skipped:
+                skip_item.setToolTip("Skipped:\n" + "\n".join(skipped[:10]))
+                skip_item.setBackground(QtGui.QColor(255, 200, 100))  # Light orange
+            self.table.setItem(row, 3, skip_item)
+
+            # Output path (editable for file trials, read-only for current)
+            if is_current:
+                path_item = QtWidgets.QTableWidgetItem("(current session)")
+                path_item.setFlags(path_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                path_item.setForeground(QtGui.QColor(128, 128, 128))
+            else:
+                default_output = result.get("default_output", "")
+                path_item = QtWidgets.QTableWidgetItem(default_output)
+            self.table.setItem(row, 4, path_item)
+
+        # Track edits to output path
+        self.table.itemChanged.connect(self._on_item_changed)
+
+    def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        """Track manual edits to output paths."""
+        if item.column() == 4:
+            self._manually_edited.add(item.row())
+
+    def _on_pattern_changed(self, text: str) -> None:
+        """Update default output paths when pattern changes (non-edited rows only)."""
+        pass  # Pattern is applied via Apply to All button
+
+    def _apply_pattern_to_all(self) -> None:
+        """Apply current pattern to all non-current trials."""
+        import os
+
+        pattern = self.pattern_edit.text()
+
+        self.table.blockSignals(True)
+        for row, result in enumerate(self.trial_results):
+            if result["path"] == "__current__":
+                continue
+
+            original_path = result["path"]
+            base, ext = os.path.splitext(original_path)
+
+            # Apply pattern substitutions
+            suffix = pattern
+            suffix = suffix.replace("{recipe}", self.recipe_name)
+            suffix = suffix.replace("{original}", os.path.basename(base))
+
+            new_path = base + suffix + ext
+            self.table.item(row, 4).setText(new_path)
+
+        self._manually_edited.clear()
+        self.table.blockSignals(False)
+
+    def _on_preview_data(self) -> None:
+        """Show before/after plot for selected trial.
+
+        For memory optimization, original data is loaded on-demand for file trials
+        rather than being stored upfront.
+        """
+        selected_rows = list({idx.row() for idx in self.table.selectedIndexes()})
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(
+                self, "No Selection", "Please select a trial row to preview."
+            )
+            return
+
+        row = selected_rows[0]
+        result = self.trial_results[row]
+        trial_path = result["path"]
+
+        # Get original data - either from stored copy or reload from file
+        if "original_df" in result:
+            # Current session - original was stored
+            original_df = result["original_df"]
+        else:
+            # File trial - reload on-demand to save memory
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            try:
+                original_df = pd.read_csv(trial_path)
+                # Add normalized_time if not present
+                if "normalized_time" not in original_df.columns:
+                    for col in original_df.columns:
+                        if "time" in col.lower():
+                            original_df["normalized_time"] = original_df[col]
+                            break
+                    else:
+                        # No time column found, create index-based time
+                        original_df["normalized_time"] = np.arange(len(original_df)) / 120.0
+            except Exception as e:
+                QtWidgets.QApplication.restoreOverrideCursor()
+                QtWidgets.QMessageBox.warning(
+                    self, "Load Error",
+                    f"Failed to reload original data for comparison:\n{e}"
+                )
+                return
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+
+        dlg = RecipeDataPreviewDialog(
+            trial_name=self.table.item(row, 1).text(),
+            original_df=original_df,
+            processed_df=result["processed_df"],
+            signal_columns=result.get("signal_columns", []),
+            parent=self,
+        )
+        dlg.exec()
+
+    def _select_all(self) -> None:
+        """Check all trial checkboxes."""
+        for row in range(self.table.rowCount()):
+            widget = self.table.cellWidget(row, 0)
+            if widget:
+                chk = widget.findChild(QtWidgets.QCheckBox)
+                if chk:
+                    chk.setChecked(True)
+
+    def _select_none(self) -> None:
+        """Uncheck all trial checkboxes."""
+        for row in range(self.table.rowCount()):
+            widget = self.table.cellWidget(row, 0)
+            if widget:
+                chk = widget.findChild(QtWidgets.QCheckBox)
+                if chk:
+                    chk.setChecked(False)
+
+    def _validate_and_accept(self) -> None:
+        """Validate paths and accept if valid."""
+        import os
+
+        selected = self.get_selected_trials()
+        if not selected:
+            QtWidgets.QMessageBox.warning(
+                self, "No Trials Selected",
+                "Please select at least one trial to apply the recipe."
+            )
+            return
+
+        # Check for duplicate paths
+        paths = [r["output_path"] for r in selected if r["path"] != "__current__"]
+        duplicates = [p for p in paths if paths.count(p) > 1]
+        if duplicates:
+            QtWidgets.QMessageBox.warning(
+                self, "Duplicate Paths",
+                f"Duplicate output paths detected:\n{duplicates[0]}\n\n"
+                "Each trial must have a unique output path."
+            )
+            return
+
+        # Check for existing files
+        existing = [p for p in paths if os.path.exists(p)]
+        if existing:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Overwrite Files?",
+                f"{len(existing)} output file(s) already exist:\n"
+                f"{existing[0]}" + (f"\n... and {len(existing)-1} more" if len(existing) > 1 else "") +
+                "\n\nOverwrite?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        self.accept()
+
+    def get_selected_trials(self) -> List[Dict]:
+        """Return list of checked trials with their output paths."""
+        selected = []
+        for row in range(self.table.rowCount()):
+            widget = self.table.cellWidget(row, 0)
+            if not widget:
+                continue
+            chk = widget.findChild(QtWidgets.QCheckBox)
+            if not chk or not chk.isChecked():
+                continue
+
+            result = self.trial_results[row].copy()
+            path_item = self.table.item(row, 4)
+            result["output_path"] = path_item.text() if path_item else result.get("default_output", "")
+            selected.append(result)
+
+        return selected
+
+
+class ColumnRenameDialog(QtWidgets.QDialog):
+    """Dialog for renaming DataFrame columns.
+
+    Features:
+    - Two-column table: Original Name (read-only) | New Name (editable)
+    - Validation: no duplicate names, no empty names
+    - Reset button to revert all changes
+    """
+
+    def __init__(
+        self,
+        columns: List[str],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rename Columns")
+        self.resize(500, 400)
+        self.original_columns = columns
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Info label
+        info = QtWidgets.QLabel(
+            "Edit the 'New Name' column to rename channels. "
+            "Only changed names will be applied."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Table
+        self.table = QtWidgets.QTableWidget(len(self.original_columns), 2)
+        self.table.setHorizontalHeaderLabels(["Original Name", "New Name"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+
+        for row, col in enumerate(self.original_columns):
+            # Original name (read-only)
+            orig_item = QtWidgets.QTableWidgetItem(col)
+            orig_item.setFlags(orig_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            orig_item.setBackground(QtGui.QColor(240, 240, 240))
+            self.table.setItem(row, 0, orig_item)
+            # New name (editable, defaults to original)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(col))
+
+        layout.addWidget(self.table, 1)
+
+        # Buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        reset_btn = QtWidgets.QPushButton("Reset")
+        reset_btn.clicked.connect(self._reset)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+
+        ok_btn = QtWidgets.QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._validate_and_accept)
+        btn_row.addWidget(ok_btn)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _reset(self) -> None:
+        """Reset all new names to original."""
+        for row in range(self.table.rowCount()):
+            original = self.table.item(row, 0).text()
+            self.table.item(row, 1).setText(original)
+
+    def _validate_and_accept(self) -> None:
+        """Validate names and accept if valid."""
+        new_names = []
+        for row in range(self.table.rowCount()):
+            name = self.table.item(row, 1).text().strip()
+            if not name:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Name",
+                    f"Row {row + 1}: Column name cannot be empty."
+                )
+                return
+            new_names.append(name)
+
+        # Check for duplicates
+        if len(new_names) != len(set(new_names)):
+            seen: set = set()
+            for name in new_names:
+                if name in seen:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Duplicate Name",
+                        f"Column name '{name}' is used multiple times."
+                    )
+                    return
+                seen.add(name)
+
+        self.accept()
+
+    def get_mappings(self) -> Dict[str, str]:
+        """Return only columns that were renamed."""
+        mappings = {}
+        for row in range(self.table.rowCount()):
+            old = self.table.item(row, 0).text()
+            new = self.table.item(row, 1).text().strip()
+            if old != new:
+                mappings[old] = new
+        return mappings
+
+
+class ChannelDeleteDialog(QtWidgets.QDialog):
+    """Dialog for selecting channels to delete."""
+
+    def __init__(
+        self,
+        columns: List[str],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Delete Channels")
+        self.resize(400, 400)
+        self.columns = sorted(columns)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Info label
+        info = QtWidgets.QLabel("Select channels to delete:")
+        layout.addWidget(info)
+
+        # Checkbox list
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
+        )
+        for col in self.columns:
+            item = QtWidgets.QListWidgetItem(col)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget, 1)
+
+        # Select All / Select None buttons
+        select_row = QtWidgets.QHBoxLayout()
+        select_all_btn = QtWidgets.QPushButton("Select All")
+        select_all_btn.clicked.connect(self._select_all)
+        select_row.addWidget(select_all_btn)
+
+        select_none_btn = QtWidgets.QPushButton("Select None")
+        select_none_btn.clicked.connect(self._select_none)
+        select_row.addWidget(select_none_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        # Warning label
+        warning = QtWidgets.QLabel(
+            "<i>Warning: This removes data permanently.<br>"
+            "Can be undone with Ctrl+Z.</i>"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        # Buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+
+        delete_btn = QtWidgets.QPushButton("Delete")
+        delete_btn.clicked.connect(self._validate_and_accept)
+        btn_row.addWidget(delete_btn)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _select_all(self) -> None:
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+
+    def _select_none(self) -> None:
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+    def _validate_and_accept(self) -> None:
+        selected = self.get_selected_columns()
+        if not selected:
+            QtWidgets.QMessageBox.warning(
+                self, "No Selection",
+                "Please select at least one channel to delete."
+            )
+            return
+        self.accept()
+
+    def get_selected_columns(self) -> List[str]:
+        """Return list of checked columns."""
+        selected = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                selected.append(item.text())
+        return selected
+
+
+class ChannelDuplicateDialog(QtWidgets.QDialog):
+    """Dialog for duplicating channels with new names."""
+
+    def __init__(
+        self,
+        columns: List[str],
+        existing_columns: List[str],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Duplicate Channels")
+        self.resize(550, 400)
+        self.columns = sorted(columns)
+        self.existing_columns = set(existing_columns)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Info label
+        info = QtWidgets.QLabel(
+            "Select channels to duplicate and set new names:"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Table
+        self.table = QtWidgets.QTableWidget(len(self.columns), 3)
+        self.table.setHorizontalHeaderLabels(["", "Source", "New Name"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Fixed
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self.table.setColumnWidth(0, 30)
+
+        for row, col in enumerate(self.columns):
+            # Checkbox
+            chk = QtWidgets.QCheckBox()
+            chk_widget = QtWidgets.QWidget()
+            chk_layout = QtWidgets.QHBoxLayout(chk_widget)
+            chk_layout.addWidget(chk)
+            chk_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            chk_layout.setContentsMargins(0, 0, 0, 0)
+            self.table.setCellWidget(row, 0, chk_widget)
+
+            # Source name (read-only)
+            source_item = QtWidgets.QTableWidgetItem(col)
+            source_item.setFlags(source_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            source_item.setBackground(QtGui.QColor(240, 240, 240))
+            self.table.setItem(row, 1, source_item)
+
+            # New name (editable)
+            new_item = QtWidgets.QTableWidgetItem(f"{col}_copy")
+            self.table.setItem(row, 2, new_item)
+
+        layout.addWidget(self.table, 1)
+
+        # Buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+
+        dup_btn = QtWidgets.QPushButton("Duplicate")
+        dup_btn.setDefault(True)
+        dup_btn.clicked.connect(self._validate_and_accept)
+        btn_row.addWidget(dup_btn)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _validate_and_accept(self) -> None:
+        mappings = self.get_mappings()
+        if not mappings:
+            QtWidgets.QMessageBox.warning(
+                self, "No Selection",
+                "Please select at least one channel to duplicate."
+            )
+            return
+
+        # Check for empty names
+        for source, new_name in mappings.items():
+            if not new_name.strip():
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid Name",
+                    f"New name for '{source}' cannot be empty."
+                )
+                return
+
+        # Check for duplicate new names
+        new_names = list(mappings.values())
+        if len(new_names) != len(set(new_names)):
+            QtWidgets.QMessageBox.warning(
+                self, "Duplicate Names",
+                "New names must be unique."
+            )
+            return
+
+        # Check for conflict with existing columns
+        conflicts = [n for n in new_names if n in self.existing_columns]
+        if conflicts:
+            QtWidgets.QMessageBox.warning(
+                self, "Name Conflict",
+                f"Column name '{conflicts[0]}' already exists."
+            )
+            return
+
+        self.accept()
+
+    def get_mappings(self) -> Dict[str, str]:
+        """Return {source: new_name} for checked rows."""
+        mappings = {}
+        for row in range(self.table.rowCount()):
+            widget = self.table.cellWidget(row, 0)
+            if not widget:
+                continue
+            chk = widget.findChild(QtWidgets.QCheckBox)
+            if not chk or not chk.isChecked():
+                continue
+
+            source = self.table.item(row, 1).text()
+            new_name = self.table.item(row, 2).text().strip()
+            mappings[source] = new_name
+
+        return mappings
+
+
+class DerivedChannelDialog(QtWidgets.QDialog):
+    """Dialog for creating derived channels from expressions."""
+
+    SAFE_FUNCTIONS = [
+        "abs", "sqrt", "sin", "cos", "tan", "log", "log10", "exp", "pow",
+        "mean", "std", "min", "max", "sum", "median", "var",
+        "floor", "ceil", "round", "clip",
+    ]
+
+    def __init__(
+        self,
+        columns: List[str],
+        df: pd.DataFrame,
+        existing_columns: List[str],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Create Derived Channel")
+        self.resize(700, 550)
+        self.columns = sorted(columns)
+        self.df = df
+        self.existing_columns = set(existing_columns)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Output name
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.addWidget(QtWidgets.QLabel("Output name:"))
+        self.name_edit = QtWidgets.QLineEdit()
+        self.name_edit.setPlaceholderText("e.g., velocity_magnitude")
+        name_row.addWidget(self.name_edit, 1)
+        layout.addLayout(name_row)
+
+        # Expression
+        layout.addWidget(QtWidgets.QLabel("Expression:"))
+        self.expr_edit = QtWidgets.QPlainTextEdit()
+        self.expr_edit.setPlaceholderText("e.g., sqrt(gaze_x**2 + gaze_y**2)")
+        self.expr_edit.setMaximumHeight(80)
+        self.expr_edit.textChanged.connect(self._on_expression_changed)
+        layout.addWidget(self.expr_edit)
+
+        # Columns and functions side by side
+        helpers_layout = QtWidgets.QHBoxLayout()
+
+        # Available columns
+        col_group = QtWidgets.QGroupBox("Available Columns (double-click to insert)")
+        col_layout = QtWidgets.QVBoxLayout(col_group)
+        self.col_list = QtWidgets.QListWidget()
+        self.col_list.addItems(self.columns)
+        self.col_list.itemDoubleClicked.connect(self._insert_column)
+        col_layout.addWidget(self.col_list)
+        helpers_layout.addWidget(col_group)
+
+        # Available functions
+        func_group = QtWidgets.QGroupBox("Functions (double-click to insert)")
+        func_layout = QtWidgets.QVBoxLayout(func_group)
+        self.func_list = QtWidgets.QListWidget()
+        self.func_list.addItems(self.SAFE_FUNCTIONS)
+        self.func_list.itemDoubleClicked.connect(self._insert_function)
+        func_layout.addWidget(self.func_list)
+        helpers_layout.addWidget(func_group)
+
+        layout.addLayout(helpers_layout, 1)
+
+        # Preview
+        preview_group = QtWidgets.QGroupBox("Preview (first 5 rows)")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        self.preview_table = QtWidgets.QTableWidget(5, 2)
+        self.preview_table.setHorizontalHeaderLabels(["normalized_time", "result"])
+        self.preview_table.horizontalHeader().setStretchLastSection(True)
+        self.preview_table.setMaximumHeight(150)
+        preview_layout.addWidget(self.preview_table)
+        layout.addWidget(preview_group)
+
+        # Status
+        self.status_label = QtWidgets.QLabel("Enter an expression to preview")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+
+        create_btn = QtWidgets.QPushButton("Create")
+        create_btn.setDefault(True)
+        create_btn.clicked.connect(self._validate_and_accept)
+        btn_row.addWidget(create_btn)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _insert_column(self, item: QtWidgets.QListWidgetItem) -> None:
+        """Insert column name at cursor."""
+        cursor = self.expr_edit.textCursor()
+        cursor.insertText(item.text())
+        self.expr_edit.setFocus()
+
+    def _insert_function(self, item: QtWidgets.QListWidgetItem) -> None:
+        """Insert function at cursor."""
+        cursor = self.expr_edit.textCursor()
+        cursor.insertText(f"{item.text()}()")
+        # Move cursor inside parentheses
+        cursor.movePosition(cursor.MoveOperation.Left)
+        self.expr_edit.setTextCursor(cursor)
+        self.expr_edit.setFocus()
+
+    def _on_expression_changed(self) -> None:
+        """Validate and preview expression."""
+        expr = self.expr_edit.toPlainText().strip()
+        if not expr:
+            self.status_label.setText("Enter an expression to preview")
+            self._clear_preview()
+            return
+
+        try:
+            # Try to evaluate expression
+            result = pd.eval(expr, local_dict=self.df.to_dict("series"))
+
+            # Show preview
+            self._update_preview(result)
+            self.status_label.setText(
+                f"<span style='color: green;'>Valid expression. "
+                f"Result type: {result.dtype}</span>"
+            )
+        except Exception as e:
+            self.status_label.setText(
+                f"<span style='color: red;'>Error: {type(e).__name__}: {str(e)[:80]}</span>"
+            )
+            self._clear_preview()
+
+    def _update_preview(self, result: pd.Series) -> None:
+        """Update preview table with result."""
+        n = min(5, len(result))
+        self.preview_table.setRowCount(n)
+
+        time_col = self.df.get("normalized_time", pd.Series(range(len(self.df))))
+
+        for i in range(n):
+            time_item = QtWidgets.QTableWidgetItem(f"{time_col.iloc[i]:.3f}")
+            time_item.setFlags(time_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.preview_table.setItem(i, 0, time_item)
+
+            val = result.iloc[i]
+            val_str = f"{val:.4f}" if isinstance(val, (int, float)) and not np.isnan(val) else str(val)
+            val_item = QtWidgets.QTableWidgetItem(val_str)
+            val_item.setFlags(val_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.preview_table.setItem(i, 1, val_item)
+
+    def _clear_preview(self) -> None:
+        """Clear preview table."""
+        self.preview_table.setRowCount(0)
+
+    def _validate_and_accept(self) -> None:
+        """Validate and accept."""
+        name = self.name_edit.text().strip()
+        expr = self.expr_edit.toPlainText().strip()
+
+        if not name:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing Name",
+                "Please enter an output name."
+            )
+            return
+
+        if not expr:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing Expression",
+                "Please enter an expression."
+            )
+            return
+
+        if name in self.existing_columns:
+            QtWidgets.QMessageBox.warning(
+                self, "Name Conflict",
+                f"Column name '{name}' already exists."
+            )
+            return
+
+        # Validate expression
+        try:
+            pd.eval(expr, local_dict=self.df.to_dict("series"))
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Expression",
+                f"Expression error:\n{type(e).__name__}: {e}"
+            )
+            return
+
+        self.accept()
+
+    def get_params(self) -> Dict:
+        """Return {"name": str, "expr": str}."""
+        return {
+            "name": self.name_edit.text().strip(),
+            "expr": self.expr_edit.toPlainText().strip(),
+        }

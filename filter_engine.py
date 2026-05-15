@@ -110,6 +110,36 @@ class FilterEngine:
             elif filter_type == "invert_reference":
                 ref = float(params.get("reference", 0.0))
                 filtered = 2 * ref - series
+            elif filter_type == "mirror":
+                mode = params.get("mirror_mode", "midpoint")
+                if mode == "midpoint":
+                    # Mirror around the midpoint between min and max
+                    ref = (series.max() + series.min()) / 2
+                elif mode == "median":
+                    # Mirror around the median (robust to outliers)
+                    ref = series.median()
+                elif mode == "max":
+                    # Mirror around the maximum value
+                    ref = series.max()
+                elif mode == "min":
+                    # Mirror around the minimum value
+                    ref = series.min()
+                elif mode == "first":
+                    # Mirror around the value at the first timestamp
+                    ref = series.iloc[0]
+                else:
+                    ref = (series.max() + series.min()) / 2  # fallback to midpoint
+                filtered = 2 * ref - series
+            elif filter_type == "circular_flip":
+                # Flip heading/orientation by 180° with proper circular wrapping
+                # 0° → 180°, 180° → 0°, 90° → -90° (or 270°), etc.
+                wrap_mode = params.get("wrap_mode", "signed")
+                if wrap_mode == "unsigned":
+                    # Output in [0, 360) range
+                    filtered = (series + 180) % 360
+                else:
+                    # Output in [-180, 180] range (signed, default)
+                    filtered = ((series + 180 + 180) % 360) - 180
             elif filter_type == "constant_offset":
                 offset = float(params.get("offset", 0.0))
                 filtered = series + offset
@@ -465,6 +495,8 @@ def available_filters() -> List[str]:
         "invert_polarity",
         "invert_mean",
         "invert_reference",
+        "mirror",
+        "circular_flip",
         "constant_offset",
     ]
 
