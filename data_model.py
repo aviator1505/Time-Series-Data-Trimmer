@@ -74,11 +74,24 @@ class DataModel(QtCore.QObject):
     # Loading and classification
     # ------------------------------------------------------------------
     def load_csv(self, path: str) -> None:
+        df = self.read_csv_frame(path)
+        self.load_frame(df, path)
+
+    @staticmethod
+    def read_csv_frame(path: str) -> pd.DataFrame:
+        """Parse a CSV into a normalized DataFrame.
+
+        Pure compute with no model mutation, so it is safe to run on a
+        worker thread; pass the result to load_frame on the UI thread.
+        """
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
         df = pd.read_csv(path)
         # Normalize NaNs
-        df = df.replace({"": np.nan, "nan": np.nan, "NaN": np.nan})
+        return df.replace({"": np.nan, "nan": np.nan, "NaN": np.nan})
+
+    def load_frame(self, df: pd.DataFrame, path: str) -> None:
+        """Adopt a parsed DataFrame as the new session (resets all state)."""
         self.original_df = df.copy()
         self.df = df.copy()
         self._classify_columns(df)

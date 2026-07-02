@@ -109,6 +109,7 @@ def validate_plugin_expression(expr: str, available_columns: List[str]) -> Tuple
 
     return True, ""
 
+from background import run_in_background
 from data_model import AnnotationSegment, DataModel, OperationRecord
 from dialogs import (
     AnnotationTable,
@@ -810,7 +811,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_panel.refresh()
 
     def load_file(self, path: str) -> None:
-        self.data_model.load_csv(path)
+        """Parse the CSV on a worker thread, then adopt it on the UI thread."""
+        busy = QtWidgets.QProgressDialog(f"Loading {os.path.basename(path)}…", None, 0, 0, self)
+        busy.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        busy.setMinimumDuration(300)
+
+        def done(df: pd.DataFrame) -> None:
+            busy.close()
+            self.data_model.load_frame(df, path)
+            self._after_load(path)
+
+        def fail(exc: BaseException) -> None:
+            busy.close()
+            QtWidgets.QMessageBox.critical(
+                self, "Load Error",
+                f"Failed to load {os.path.basename(path)}:\n{type(exc).__name__}: {exc}"
+            )
+
+        run_in_background(DataModel.read_csv_frame, path, on_finished=done, on_error=fail)
+
+    def _after_load(self, path: str) -> None:
         self.loaded_file_path = path
         self.filter_engine.set_sample_rate(self.data_model.sample_rate)
         groups = self.data_model.channel_groups()
@@ -1344,78 +1364,80 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_flag = params.pop("preview", False)
         df_current = self.data_model.get_dataframe()
 
-        # Progress indication for large datasets
-        row_count = len(df_current)
-        progress = None
-        if row_count > 10000 and not preview:
-            progress = QtWidgets.QProgressDialog(
-                "Applying filter...", "Cancel", 0, 100, self
-            )
-            progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(500)
-            progress.setValue(10)
-            QtWidgets.QApplication.processEvents()
+        # The filter math runs on a worker thread; the busy dialog keeps the
+        # window modal-but-responsive. Cancel drops the result when it lands.
+        busy = QtWidgets.QProgressDialog("Applying filter…", "Cancel", 0, 0, self)
+        busy.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        busy.setMinimumDuration(300)
 
-        try:
-            if progress:
-                progress.setValue(30)
-                QtWidgets.QApplication.processEvents()
-                if progress.wasCanceled():
-                    return
+        def done(df_new: pd.DataFrame) -> None:
+            busy.close()
+            try:
+                self._finish_filter(df_new, df_current, chans, filter_type, params,
+                                    selection, preview_flag)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error",
+                    f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
+                )
 
-            df_new = self.filter_engine.apply(
-                df_current, chans, filter_type, params, selection=selection
-            )
+        def fail(exc: BaseException) -> None:
+            busy.close()
+            if isinstance(exc, ValueError):
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error", f"Invalid filter parameters:\n{exc}"
+                )
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error",
+                    f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
+                )
 
-            if progress:
-                progress.setValue(70)
-                QtWidgets.QApplication.processEvents()
-                if progress.wasCanceled():
-                    return
+        job = run_in_background(
+            self.filter_engine.apply,
+            df_current, chans, filter_type, params,
+            selection=selection,
+            on_finished=done, on_error=fail,
+        )
+        busy.canceled.connect(job.cancel)
 
-            if filter_type == "resample":
-                self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
-            if preview_flag and chans:
-                ch = chans[0]
-                time = df_new["normalized_time"].to_numpy()
-                orig_series = df_current[ch]
-                orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
-                filt = df_new[ch].to_numpy()
-                orig = orig_series.to_numpy()
-                if len(time) != len(orig) or len(time) != len(filt):
-                    try:
-                        # interpolate original onto new time base for preview
-                        orig = np.interp(time, orig_time, orig_series)
-                    except Exception:
-                        # last resort: truncate to common minimum length
-                        n = min(len(time), len(orig), len(filt))
-                        time = time[:n]
-                        orig = orig[:n]
-                        filt = filt[:n]
-                prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
-                if not prev_dlg.exec():
-                    return
+    def _finish_filter(
+        self,
+        df_new: pd.DataFrame,
+        df_current: pd.DataFrame,
+        chans: List[str],
+        filter_type: str,
+        params: Dict,
+        selection: Optional[Tuple[float, float]],
+        preview_flag: bool,
+    ) -> None:
+        """UI-thread continuation of apply_filters_from_panel."""
+        if filter_type == "resample":
+            self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
+        if preview_flag and chans:
+            ch = chans[0]
+            time = df_new["normalized_time"].to_numpy()
+            orig_series = df_current[ch]
+            orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
+            filt = df_new[ch].to_numpy()
+            orig = orig_series.to_numpy()
+            if len(time) != len(orig) or len(time) != len(filt):
+                try:
+                    # interpolate original onto new time base for preview
+                    orig = np.interp(time, orig_time, orig_series)
+                except Exception:
+                    # last resort: truncate to common minimum length
+                    n = min(len(time), len(orig), len(filt))
+                    time = time[:n]
+                    orig = orig[:n]
+                    filt = filt[:n]
+            prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
+            if not prev_dlg.exec():
+                return
 
-            if progress:
-                progress.setValue(90)
-                QtWidgets.QApplication.processEvents()
-
-            start = selection[0] if selection else 0.0
-            end = selection[1] if selection else df_new["normalized_time"].max()
-            self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
-
-            if progress:
-                progress.setValue(100)
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(
-                self, "Filter Error",
-                f"Invalid filter parameters:\n{e}"
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self, "Filter Error",
-                f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
-            )
+        start = selection[0] if selection else 0.0
+        end = selection[1] if selection else df_new["normalized_time"].max()
+        self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
 
     def save_recipe(self) -> None:
         if not self.data_model.history:
