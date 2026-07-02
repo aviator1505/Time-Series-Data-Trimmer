@@ -13,7 +13,7 @@ dependencies = [
     "numpy~=2.4",
     "pandas~=3.0",
     "scipy~=1.17",
-    "PyQt6~=6.11",
+    "PySide6-Essentials~=6.11",
     "pyqtgraph~=0.14",
     "PyOpenGL~=3.1",
     "pydantic~=2.13",
@@ -46,6 +46,7 @@ py-modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+qt_api = "pyside6"
 
 [tool.ruff]
 line-length = 120

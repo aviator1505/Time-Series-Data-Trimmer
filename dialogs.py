@@ -5,9 +5,11 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+# Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
+# even if another Qt binding is installed in the environment.
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtGui import QKeySequence, QShortcut
 import pyqtgraph as pg
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtGui import QKeySequence, QShortcut
 
 from data_model import AnnotationSegment
 from filter_engine import available_filters
@@ -325,8 +327,8 @@ class FilterDialog(QtWidgets.QDialog):
 
 
 class FilterPanel(QtWidgets.QWidget):
-    applyRequested = QtCore.pyqtSignal()
-    previewRequested = QtCore.pyqtSignal()
+    applyRequested = QtCore.Signal()
+    previewRequested = QtCore.Signal()
 
     def __init__(self, channels: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)

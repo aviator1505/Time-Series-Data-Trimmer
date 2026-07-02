@@ -10,7 +10,7 @@ and a minimal plugin/recipe system.
 
 Dependencies
 ------------
-pip install PyQt6 pyqtgraph pandas numpy scipy
+pip install PySide6 pyqtgraph pandas numpy scipy
 
 Run
 ---
@@ -37,9 +37,11 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+# Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
+# even if another Qt binding is installed in the environment.
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import pyqtgraph.exporters  # noqa: F401 - module provides exporters used dynamically
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 
 # Security: Patterns to block in plugin expressions
@@ -137,7 +139,7 @@ from project_manager import ProjectManager, load_signal_presets, save_signal_pre
 class ChannelManagerWidget(QtWidgets.QWidget):
     """Panel listing time/metadata/signals with show/hide checkboxes."""
 
-    channelToggled = QtCore.pyqtSignal()
+    channelToggled = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -296,7 +298,7 @@ class ChannelManagerWidget(QtWidgets.QWidget):
 class ChannelStylePanel(QtWidgets.QWidget):
     """Assign per-channel plot styles overriding the global plot style."""
 
-    styleChanged = QtCore.pyqtSignal(str, str)
+    styleChanged = QtCore.Signal(str, str)
 
     def __init__(self, style_map: Dict[str, str], parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -366,7 +368,7 @@ class OperationHistoryWidget(QtWidgets.QListWidget):
 
 
 class ProjectPanel(QtWidgets.QWidget):
-    trialSelected = QtCore.pyqtSignal(str)
+    trialSelected = QtCore.Signal(str)
 
     def __init__(self, project: ProjectManager, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt6 import QtCore
+from PySide6 import QtCore
 
 
 @dataclass
@@ -43,10 +43,10 @@ class DataModel(QtCore.QObject):
     # Epsilon for floating-point time comparisons (sub-nanosecond precision)
     TIME_EPSILON = 1e-9
 
-    dataChanged = QtCore.pyqtSignal()
-    annotationsChanged = QtCore.pyqtSignal()
-    statusMessage = QtCore.pyqtSignal(str)
-    historyChanged = QtCore.pyqtSignal()
+    dataChanged = QtCore.Signal()
+    annotationsChanged = QtCore.Signal()
+    statusMessage = QtCore.Signal(str)
+    historyChanged = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)

@@ -6,8 +6,10 @@ from typing import Dict, List, Optional, Iterable
 
 import numpy as np
 import pandas as pd
+# Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
+# even if another Qt binding is installed in the environment.
+from PySide6 import QtGui
 import pyqtgraph.opengl as gl
-from PyQt6 import QtGui
 
 
 class PlotController3D:
