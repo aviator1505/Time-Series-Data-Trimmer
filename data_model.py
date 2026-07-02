@@ -69,6 +69,8 @@ class DataModel(QtCore.QObject):
         self._id_counter: int = 1
         # User preference: whether to preserve timing gaps after deletion
         self.preserve_timing_gaps: bool = False
+        # Report from the last adaptive ingest (None until a file is loaded)
+        self.ingest_report = None
 
     # ------------------------------------------------------------------
     # Loading and classification
@@ -79,19 +81,23 @@ class DataModel(QtCore.QObject):
 
     @staticmethod
     def read_csv_frame(path: str) -> pd.DataFrame:
-        """Parse a CSV into a normalized DataFrame.
+        """Parse a tabular file into a normalized DataFrame.
 
-        Pure compute with no model mutation, so it is safe to run on a
-        worker thread; pass the result to load_frame on the UI thread.
+        Uses adaptive ingestion (delimiter/encoding sniffing, numeric
+        coercion, time-unit detection); the IngestReport rides along in
+        df.attrs["ingest_report"]. Pure compute with no model mutation,
+        so it is safe to run on a worker thread; pass the result to
+        load_frame on the UI thread.
         """
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
-        df = pd.read_csv(path)
-        # Normalize NaNs
-        return df.replace({"": np.nan, "nan": np.nan, "NaN": np.nan})
+        from ingest import smart_read
+
+        df, report = smart_read(path)
+        df.attrs["ingest_report"] = report
+        return df
 
     def load_frame(self, df: pd.DataFrame, path: str) -> None:
         """Adopt a parsed DataFrame as the new session (resets all state)."""
+        self.ingest_report = df.attrs.get("ingest_report")
         self.original_df = df.copy()
         self.df = df.copy()
         self._classify_columns(df)
@@ -104,7 +110,11 @@ class DataModel(QtCore.QObject):
         self._id_counter = 1
         self.sample_rate = self._infer_sample_rate()
         self.dataChanged.emit()
-        self.statusMessage.emit(f"Loaded {os.path.basename(path)}")
+        message = f"Loaded {os.path.basename(path)}"
+        detected = self.ingest_report.summary() if self.ingest_report is not None else ""
+        if detected:
+            message += f" | detected: {detected}"
+        self.statusMessage.emit(message)
 
     def _classify_columns(self, df: pd.DataFrame) -> None:
         time_candidates = [c for c in df.columns if "time" in c.lower()]

@@ -18,8 +18,10 @@ from data_model import DataModel
 
 def test_job_delivers_result(qtbot):
     results = []
-    job = run_in_background(lambda a, b: a + b, 2, 3, on_finished=results.append)
-    qtbot.waitSignal(job.signals.finished, timeout=5000).wait()
+    run_in_background(lambda a, b: a + b, 2, 3, on_finished=results.append)
+    # waitUntil avoids the race where the job finishes before a signal
+    # waiter is registered
+    qtbot.waitUntil(lambda: bool(results), timeout=5000)
     assert results == [5]
 
 
@@ -29,9 +31,8 @@ def test_job_delivers_error(qtbot):
     def boom():
         raise RuntimeError("worker failed")
 
-    job = run_in_background(boom, on_error=errors.append)
-    qtbot.waitSignal(job.signals.error, timeout=5000).wait()
-    assert len(errors) == 1
+    run_in_background(boom, on_error=errors.append)
+    qtbot.waitUntil(lambda: bool(errors), timeout=5000)
     assert isinstance(errors[0], RuntimeError)
     assert str(errors[0]) == "worker failed"
 

@@ -21,6 +21,7 @@ _active_jobs: set[BackgroundJob] = set()
 class _JobSignals(QtCore.QObject):
     finished = QtCore.Signal(object)  # result of fn
     error = QtCore.Signal(object)  # the raised exception
+    done = QtCore.Signal()  # always emitted last; drives UI-thread cleanup
 
 
 class BackgroundJob(QtCore.QRunnable):
@@ -28,6 +29,9 @@ class BackgroundJob(QtCore.QRunnable):
 
     def __init__(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         super().__init__()
+        # The job must stay referenced until queued signals are delivered on
+        # the UI thread, so cleanup happens via the done signal — never here.
+        self.setAutoDelete(False)
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
@@ -35,7 +39,7 @@ class BackgroundJob(QtCore.QRunnable):
         self.cancelled = False  # cooperative: result is dropped, not interrupted
 
     def cancel(self) -> None:
-        """Mark the job cancelled: it still runs, but emits nothing."""
+        """Mark the job cancelled: it still runs, but emits no result/error."""
         self.cancelled = True
 
     @QtCore.Slot()
@@ -49,7 +53,7 @@ class BackgroundJob(QtCore.QRunnable):
             if not self.cancelled:
                 self.signals.finished.emit(result)
         finally:
-            _active_jobs.discard(self)
+            self.signals.done.emit()
 
 
 def run_in_background(
@@ -71,5 +75,8 @@ def run_in_background(
     if on_error is not None:
         job.signals.error.connect(on_error)
     _active_jobs.add(job)
+    # done is queued after finished/error, so the job is released only once
+    # its result has been delivered on the UI thread.
+    job.signals.done.connect(lambda: _active_jobs.discard(job))
     QtCore.QThreadPool.globalInstance().start(job)
     return job
