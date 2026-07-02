@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "time-series-data-trimmer"
+version = "1.0.0"
+description = "Scientific time-series annotation & cleaning workbench for gaze/kinematics/IMU CSV datasets"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy~=2.4",
+    "pandas~=3.0",
+    "scipy~=1.17",
+    "PySide6-Essentials~=6.11",
+    "pyqtgraph~=0.14",
+    "PyOpenGL~=3.1",
+    "pydantic~=2.13",
+    "pyarrow~=24.0",
+    "charset-normalizer~=3.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.1",
+    "pytest-qt~=4.5",
+    "ruff~=0.15",
+]
+
+[project.gui-scripts]
+tsdt = "main:main"
+
+[tool.setuptools]
+py-modules = [
+    "main",
+    "data_model",
+    "filter_engine",
+    "plot2d",
+    "plot3d",
+    "dialogs",
+    "project_manager",
+    "plugin_system",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+qt_api = "pyside6"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501", # long lines exist in legacy UI code; enforced loosely for now
+]

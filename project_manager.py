@@ -7,15 +7,15 @@ import pathlib
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, asdict, fields
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 # Schema version for project files - increment when format changes
 PROJECT_SCHEMA_VERSION = 1
 
 
-@dataclass
-class ParsedFilename:
+class ParsedFilename(BaseModel):
     """Result of parsing a trial filename."""
     trial_number: int
     session: int
@@ -67,8 +67,11 @@ def parse_trial_filename(filepath: str) -> ParsedFilename:
         )
 
 
-@dataclass
-class TrialEntry:
+class TrialEntry(BaseModel):
+    """One trial in a project. Unknown fields from newer formats are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     path: str
     participant: str = ""
     condition: str = ""
@@ -81,18 +84,21 @@ class TrialEntry:
     angle: int = 0
 
 
-@dataclass
-class Recipe:
+class Recipe(BaseModel):
+    """A named sequence of operations. Unknown fields are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     name: str
-    operations: List[Dict]
+    operations: list[dict]
 
 
 class ProjectManager:
     def __init__(self) -> None:
-        self.project_path: Optional[str] = None
-        self.trials: List[TrialEntry] = []
-        self.recipes: List[Recipe] = []
-        self.preferences: Dict = {
+        self.project_path: str | None = None
+        self.trials: list[TrialEntry] = []
+        self.recipes: list[Recipe] = []
+        self.preferences: dict = {
             "default_fs": 120.0,
             "default_output_dir": os.getcwd(),
         }
@@ -106,7 +112,7 @@ class ProjectManager:
     def add_trial(self, path: str, participant: str = "", condition: str = "") -> None:
         self.trials.append(TrialEntry(path=path, participant=participant, condition=condition))
 
-    def add_trials_bulk(self, entries: List[TrialEntry]) -> None:
+    def add_trials_bulk(self, entries: list[TrialEntry]) -> None:
         """Add multiple trials at once."""
         self.trials.extend(entries)
 
@@ -123,8 +129,8 @@ class ProjectManager:
             return
         data = {
             "schema_version": PROJECT_SCHEMA_VERSION,
-            "trials": [asdict(t) for t in self.trials],
-            "recipes": [asdict(r) for r in self.recipes],
+            "trials": [t.model_dump() for t in self.trials],
+            "recipes": [r.model_dump() for r in self.recipes],
             "preferences": self.preferences,
         }
 
@@ -144,7 +150,7 @@ class ProjectManager:
                 pass
             raise
 
-    def _migrate_schema(self, data: Dict, from_version: int) -> Dict:
+    def _migrate_schema(self, data: dict, from_version: int) -> dict:
         """Migrate data from older schema versions.
 
         Args:
@@ -164,7 +170,7 @@ class ProjectManager:
     def load(self, path: str) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         self.project_path = path
 
@@ -173,26 +179,22 @@ class ProjectManager:
         if schema_version < PROJECT_SCHEMA_VERSION:
             data = self._migrate_schema(data, schema_version)
 
-        # Safely load trials with unknown field tolerance
+        # Safely load trials; unknown fields are ignored by the model config
         trials_data = data.get("trials", [])
         self.trials = []
-        known_trial_fields = {f.name for f in fields(TrialEntry)}
         for t in trials_data:
             try:
-                filtered = {k: v for k, v in t.items() if k in known_trial_fields}
-                self.trials.append(TrialEntry(**filtered))
+                self.trials.append(TrialEntry.model_validate(t))
             except (TypeError, ValueError):
-                # Skip malformed trial entries
+                # Skip malformed trial entries (ValidationError is a ValueError)
                 continue
 
         # Same for recipes
         recipes_data = data.get("recipes", [])
         self.recipes = []
-        known_recipe_fields = {f.name for f in fields(Recipe)}
         for r in recipes_data:
             try:
-                filtered = {k: v for k, v in r.items() if k in known_recipe_fields}
-                self.recipes.append(Recipe(**filtered))
+                self.recipes.append(Recipe.model_validate(r))
             except (TypeError, ValueError):
                 # Skip malformed recipe entries
                 continue
@@ -200,8 +202,8 @@ class ProjectManager:
         # Merge preferences to preserve new defaults
         self.preferences = {**self.preferences, **data.get("preferences", {})}
 
-    def export_summary(self) -> List[Dict]:
-        return [asdict(t) for t in self.trials]
+    def export_summary(self) -> list[dict]:
+        return [t.model_dump() for t in self.trials]
 
     def add_recipe(self, recipe: Recipe) -> None:
         self.recipes.append(recipe)
@@ -227,18 +229,18 @@ def _get_presets_path() -> pathlib.Path:
 SIGNAL_PRESETS_FILE = _get_presets_path()
 
 
-def load_signal_presets() -> Dict[str, Dict]:
+def load_signal_presets() -> dict[str, dict]:
     """Load signal presets from disk."""
     if not SIGNAL_PRESETS_FILE.is_file():
         return {}
     try:
-        with open(SIGNAL_PRESETS_FILE, "r", encoding="utf-8") as f:
+        with open(SIGNAL_PRESETS_FILE, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def save_signal_presets(presets: Dict[str, Dict]) -> None:
+def save_signal_presets(presets: dict[str, dict]) -> None:
     """Save signal presets to disk with atomic write."""
     try:
         preset_dir = SIGNAL_PRESETS_FILE.parent
@@ -260,13 +262,13 @@ def save_signal_presets(presets: Dict[str, Dict]) -> None:
         print(f"Failed to save presets: {e}")
 
 
-def load_ui_state() -> Dict[str, Any]:
+def load_ui_state() -> dict[str, Any]:
     """Load UI state (splitter positions) from signal_presets.json."""
     presets = load_signal_presets()
     return presets.get("__ui_state__", {})
 
 
-def save_ui_state(state: Dict[str, Any]) -> None:
+def save_ui_state(state: dict[str, Any]) -> None:
     """Save UI state to signal_presets.json under __ui_state__ key."""
     presets = load_signal_presets()
     presets["__ui_state__"] = state

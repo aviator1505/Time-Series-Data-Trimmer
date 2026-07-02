@@ -5,9 +5,11 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+# Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
+# even if another Qt binding is installed in the environment.
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtGui import QKeySequence, QShortcut
 import pyqtgraph as pg
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtGui import QKeySequence, QShortcut
 
 from data_model import AnnotationSegment
 from filter_engine import available_filters
@@ -325,8 +327,8 @@ class FilterDialog(QtWidgets.QDialog):
 
 
 class FilterPanel(QtWidgets.QWidget):
-    applyRequested = QtCore.pyqtSignal()
-    previewRequested = QtCore.pyqtSignal()
+    applyRequested = QtCore.Signal()
+    previewRequested = QtCore.Signal()
 
     def __init__(self, channels: List[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -734,8 +736,11 @@ class PreferencesDialog(QtWidgets.QDialog):
         h = QtWidgets.QHBoxLayout()
         h.addWidget(self.output_dir)
         h.addWidget(self.output_btn)
+        self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.addItems(["System", "Light", "Dark"])
         layout.addRow("Default sampling rate", self.fs_spin)
         layout.addRow("Default output", h)
+        layout.addRow("Theme", self.theme_combo)
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
@@ -749,7 +754,11 @@ class PreferencesDialog(QtWidgets.QDialog):
             self.output_dir.setText(path)
 
     def values(self) -> Dict:
-        return {"fs": self.fs_spin.value(), "output_dir": self.output_dir.text()}
+        return {
+            "fs": self.fs_spin.value(),
+            "output_dir": self.output_dir.text(),
+            "theme": self.theme_combo.currentText(),
+        }
 
 
 class ShortcutDialog(QtWidgets.QDialog):

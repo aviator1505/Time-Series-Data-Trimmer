@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "trials": [
+    {
+      "path": "8_1_P13_Stand_45.csv",
+      "participant": "P13",
+      "condition": "Stand",
+      "status": "cleaned",
+      "summary": "2 deletions",
+      "notes": "good trial",
+      "trial_number": 8,
+      "session": 1,
+      "angle": 45
+    },
+    {
+      "path": "9_1_P13_Sit_90.csv",
+      "participant": "P13",
+      "condition": "Sit",
+      "status": "unloaded",
+      "summary": "",
+      "notes": "",
+      "trial_number": 0,
+      "session": 0,
+      "angle": 0
+    }
+  ],
+  "recipes": [
+    {
+      "name": "standard-clean",
+      "operations": [
+        {
+          "type": "filter",
+          "filter_type": "butter_lowpass",
+          "params": {
+            "cutoff": 6.0,
+            "order": 4
+          }
+        },
+        {
+          "type": "derived",
+          "name": "gaze_speed",
+          "expression": "gaze_x.diff().abs()"
+        }
+      ]
+    }
+  ],
+  "preferences": {
+    "default_fs": 120.0,
+    "default_output_dir": "/home/user/Time-Series-Data-Trimmer"
+  }
+}

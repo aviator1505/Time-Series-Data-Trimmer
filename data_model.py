@@ -10,29 +10,34 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt6 import QtCore
+from pydantic import BaseModel, ConfigDict, Field
+from PySide6 import QtCore
 
 
-@dataclass
-class AnnotationSegment:
+class AnnotationSegment(BaseModel):
+    """A labeled time segment. Unknown fields from newer file formats are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     start: float
     end: float
     label: str
     track: str = "default"
     color: str = "#4e79a7"
-    id: int = field(default_factory=lambda: uuid.uuid4().int & 0x7FFFFFFF)
-    episode_index: Optional[int] = None  # Manual episode index override for CSV export
+    id: int = Field(default_factory=lambda: uuid.uuid4().int & 0x7FFFFFFF)
+    episode_index: int | None = None  # Manual episode index override for CSV export
 
 
-@dataclass
-class OperationRecord:
+class OperationRecord(BaseModel):
+    """One entry in the operation history. Unknown fields are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     description: str
-    params: Dict
+    params: dict
     start: float
     end: float
 
@@ -43,37 +48,56 @@ class DataModel(QtCore.QObject):
     # Epsilon for floating-point time comparisons (sub-nanosecond precision)
     TIME_EPSILON = 1e-9
 
-    dataChanged = QtCore.pyqtSignal()
-    annotationsChanged = QtCore.pyqtSignal()
-    statusMessage = QtCore.pyqtSignal(str)
-    historyChanged = QtCore.pyqtSignal()
+    dataChanged = QtCore.Signal()
+    annotationsChanged = QtCore.Signal()
+    statusMessage = QtCore.Signal(str)
+    historyChanged = QtCore.Signal()
 
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
-        self.df: Optional[pd.DataFrame] = None
-        self.original_df: Optional[pd.DataFrame] = None
-        self.time_columns: List[str] = []
-        self.metadata_columns: List[str] = []
-        self.signal_columns: List[str] = []
-        self.annotations: List[AnnotationSegment] = []
-        self.deletions: List[Tuple[float, float]] = []
-        self.history: List[OperationRecord] = []
+        self.df: pd.DataFrame | None = None
+        self.original_df: pd.DataFrame | None = None
+        self.time_columns: list[str] = []
+        self.metadata_columns: list[str] = []
+        self.signal_columns: list[str] = []
+        self.annotations: list[AnnotationSegment] = []
+        self.deletions: list[tuple[float, float]] = []
+        self.history: list[OperationRecord] = []
         self.sample_rate: float = 120.0
-        self._undo_stack: List[Tuple[pd.DataFrame, List[AnnotationSegment], List[Tuple[float, float]], List[OperationRecord]]] = []
-        self._redo_stack: List[Tuple[pd.DataFrame, List[AnnotationSegment], List[Tuple[float, float]], List[OperationRecord]]] = []
+        self._undo_stack: list[tuple[pd.DataFrame, list[AnnotationSegment], list[tuple[float, float]], list[OperationRecord]]] = []
+        self._redo_stack: list[tuple[pd.DataFrame, list[AnnotationSegment], list[tuple[float, float]], list[OperationRecord]]] = []
         self._id_counter: int = 1
         # User preference: whether to preserve timing gaps after deletion
         self.preserve_timing_gaps: bool = False
+        # Report from the last adaptive ingest (None until a file is loaded)
+        self.ingest_report = None
 
     # ------------------------------------------------------------------
     # Loading and classification
     # ------------------------------------------------------------------
     def load_csv(self, path: str) -> None:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
-        df = pd.read_csv(path)
-        # Normalize NaNs
-        df = df.replace({"": np.nan, "nan": np.nan, "NaN": np.nan})
+        df = self.read_csv_frame(path)
+        self.load_frame(df, path)
+
+    @staticmethod
+    def read_csv_frame(path: str) -> pd.DataFrame:
+        """Parse a tabular file into a normalized DataFrame.
+
+        Uses adaptive ingestion (delimiter/encoding sniffing, numeric
+        coercion, time-unit detection); the IngestReport rides along in
+        df.attrs["ingest_report"]. Pure compute with no model mutation,
+        so it is safe to run on a worker thread; pass the result to
+        load_frame on the UI thread.
+        """
+        from ingest import smart_read
+
+        df, report = smart_read(path)
+        df.attrs["ingest_report"] = report
+        return df
+
+    def load_frame(self, df: pd.DataFrame, path: str) -> None:
+        """Adopt a parsed DataFrame as the new session (resets all state)."""
+        self.ingest_report = df.attrs.get("ingest_report")
         self.original_df = df.copy()
         self.df = df.copy()
         self._classify_columns(df)
@@ -86,7 +110,11 @@ class DataModel(QtCore.QObject):
         self._id_counter = 1
         self.sample_rate = self._infer_sample_rate()
         self.dataChanged.emit()
-        self.statusMessage.emit(f"Loaded {os.path.basename(path)}")
+        message = f"Loaded {os.path.basename(path)}"
+        detected = self.ingest_report.summary() if self.ingest_report is not None else ""
+        if detected:
+            message += f" | detected: {detected}"
+        self.statusMessage.emit(message)
 
     def _classify_columns(self, df: pd.DataFrame) -> None:
         time_candidates = [c for c in df.columns if "time" in c.lower()]
@@ -96,8 +124,8 @@ class DataModel(QtCore.QObject):
             self.time_columns = [time_candidates[0]]
         else:
             self.time_columns = []
-        metadata_cols: List[str] = []
-        signal_cols: List[str] = []
+        metadata_cols: list[str] = []
+        signal_cols: list[str] = []
         for col in df.columns:
             if col in self.time_columns:
                 continue
@@ -234,7 +262,7 @@ class DataModel(QtCore.QObject):
             return
 
         deletion_duration = end - start
-        adjusted_annotations: List[AnnotationSegment] = []
+        adjusted_annotations: list[AnnotationSegment] = []
 
         for ann in self.annotations:
             # Case 1: Entirely BEFORE deletion - keep unchanged
@@ -316,7 +344,7 @@ class DataModel(QtCore.QObject):
 
         self.df = new_df
         self.deletions.append((start, end))
-        self.history.append(OperationRecord("delete_segment", {"deleted_samples": int(deleted_count)}, start, end))
+        self.history.append(OperationRecord(description="delete_segment", params={"deleted_samples": int(deleted_count)}, start=start, end=end))
         # Adjust annotation boundaries to account for collapsed timeline
         self._adjust_annotations_after_deletion(start, end)
         self.dataChanged.emit()
@@ -331,7 +359,7 @@ class DataModel(QtCore.QObject):
         self._push_state()
         mask = (self.df["normalized_time"] >= start) & (self.df["normalized_time"] <= end)
         self.df.loc[mask, "is_bad_segment"] = True
-        self.history.append(OperationRecord("mark_bad", {}, start, end))
+        self.history.append(OperationRecord(description="mark_bad", params={}, start=start, end=end))
         self.dataChanged.emit()
         self.historyChanged.emit()
         self.statusMessage.emit(f"Marked bad {start:.3f}-{end:.3f} s")
@@ -348,7 +376,7 @@ class DataModel(QtCore.QObject):
         ann = AnnotationSegment(start=start, end=end, label=label, track=track, color=color, id=self._id_counter)
         self._id_counter += 1
         self.annotations.append(ann)
-        self.history.append(OperationRecord("annotate", {"label": label, "track": track}, start, end))
+        self.history.append(OperationRecord(description="annotate", params={"label": label, "track": track}, start=start, end=end))
         self.annotationsChanged.emit()
         self.historyChanged.emit()
         self.statusMessage.emit(f"Annotated {start:.3f}-{end:.3f} s as {label}")
@@ -358,10 +386,10 @@ class DataModel(QtCore.QObject):
         ann_id: int,
         start: float,
         end: float,
-        label: Optional[str],
-        track: Optional[str],
-        color: Optional[str],
-        episode_index: Optional[int] = None
+        label: str | None,
+        track: str | None,
+        color: str | None,
+        episode_index: int | None = None
     ) -> None:
         self._push_state()  # Capture state before mutation for undo support
         for ann in self.annotations:
@@ -403,7 +431,7 @@ class DataModel(QtCore.QObject):
         self,
         path: str,
         embed_annotations: bool = True,
-        manual_indices: Optional[Dict[int, int]] = None
+        manual_indices: dict[int, int] | None = None
     ) -> None:
         """Save cleaned DataFrame to CSV, optionally embedding annotations.
 
@@ -430,9 +458,9 @@ class DataModel(QtCore.QObject):
 
     def save_annotations(self, path: str) -> None:
         data = {
-            "annotations": [ann.__dict__ for ann in self.annotations],
+            "annotations": [ann.model_dump() for ann in self.annotations],
             "deletions": [{"start": s, "end": e} for s, e in self.deletions],
-            "history": [record.__dict__ for record in self.history],
+            "history": [record.model_dump() for record in self.history],
             "sample_rate": self.sample_rate,
         }
         with open(path, "w", encoding="utf-8") as f:
@@ -446,13 +474,13 @@ class DataModel(QtCore.QObject):
         if not os.path.isfile(path):
             self.statusMessage.emit(f"File not found: {path}")
             return
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         anns = data.get("annotations", [])
         dels = data.get("deletions", [])
 
         # Robust annotation deserialization: skip malformed entries
-        parsed_annotations: List[AnnotationSegment] = []
+        parsed_annotations: list[AnnotationSegment] = []
         skipped_count = 0
         for a in anns:
             try:
@@ -463,7 +491,7 @@ class DataModel(QtCore.QObject):
         self.annotations = parsed_annotations
         if skipped_count > 0:
             self.statusMessage.emit(f"Skipped {skipped_count} malformed annotations")
-        parsed_deletions: List[Tuple[float, float]] = []
+        parsed_deletions: list[tuple[float, float]] = []
         for d in dels:
             if isinstance(d, dict) and "start" in d and "end" in d:
                 try:
@@ -491,7 +519,7 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Episode column conversion (annotations <-> CSV columns)
     # ------------------------------------------------------------------
-    def _parse_annotation_label(self, label: str) -> Tuple[str, str]:
+    def _parse_annotation_label(self, label: str) -> tuple[str, str]:
         """Parse annotation label into (episode_type, episode_state).
 
         Handles formats:
@@ -510,9 +538,9 @@ class DataModel(QtCore.QObject):
 
     def _assign_episode_indices(
         self,
-        annotations: List[AnnotationSegment],
-        manual_indices: Optional[Dict[int, int]] = None
-    ) -> Dict[int, int]:
+        annotations: list[AnnotationSegment],
+        manual_indices: dict[int, int] | None = None
+    ) -> dict[int, int]:
         """Assign episode indices to annotations.
 
         Priority:
@@ -534,7 +562,7 @@ class DataModel(QtCore.QObject):
         sorted_anns = sorted(annotations, key=lambda a: (a.start, a.end))
 
         # Build combined manual indices from annotation.episode_index and manual_indices param
-        combined_manual: Dict[int, int] = {}
+        combined_manual: dict[int, int] = {}
         for ann in sorted_anns:
             if ann.episode_index is not None:
                 combined_manual[ann.id] = ann.episode_index
@@ -546,7 +574,7 @@ class DataModel(QtCore.QObject):
             return {ann.id: idx + 1 for idx, ann in enumerate(sorted_anns)}
 
         # Manual assignment with shifting
-        result: Dict[int, int] = {}
+        result: dict[int, int] = {}
         used_indices: set = set(combined_manual.values())
 
         # First pass: assign manual indices
@@ -570,8 +598,8 @@ class DataModel(QtCore.QObject):
     def annotations_to_episode_columns(
         self,
         df: pd.DataFrame,
-        annotations: List[AnnotationSegment],
-        manual_indices: Optional[Dict[int, int]] = None
+        annotations: list[AnnotationSegment],
+        manual_indices: dict[int, int] | None = None
     ) -> pd.DataFrame:
         """Embed annotations as episode columns in DataFrame.
 
@@ -625,8 +653,8 @@ class DataModel(QtCore.QObject):
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
-    def channel_groups(self) -> Dict[str, List[str]]:
-        groups: Dict[str, List[str]] = {
+    def channel_groups(self) -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = {
             "Time / LSL": [],
             "Gaze": [],
             "Head": [],
@@ -680,16 +708,16 @@ class DataModel(QtCore.QObject):
             return df
         return df[(df["normalized_time"] >= start) & (df["normalized_time"] <= end)].copy()
 
-    def apply_dataframe(self, new_df: pd.DataFrame, description: str, start: float, end: float, params: Dict) -> None:
+    def apply_dataframe(self, new_df: pd.DataFrame, description: str, start: float, end: float, params: dict) -> None:
         self._push_state()
         self.df = new_df
         self._classify_columns(new_df)
         self._ensure_bad_mask()
-        self.history.append(OperationRecord(description, params, start, end))
+        self.history.append(OperationRecord(description=description, params=params, start=start, end=end))
         self.dataChanged.emit()
         self.historyChanged.emit()
 
-    def rename_channels(self, mappings: Dict[str, str]) -> None:
+    def rename_channels(self, mappings: dict[str, str]) -> None:
         """Rename columns in DataFrame and update tracking lists.
 
         Args:
@@ -718,16 +746,16 @@ class DataModel(QtCore.QObject):
         # Record in history for recipe generation
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "rename",
-            {"mappings": mappings},
-            0.0,
-            end_time
+            description="rename",
+            params={"mappings": mappings},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
         self.historyChanged.emit()
 
-    def delete_channels(self, columns: List[str]) -> None:
+    def delete_channels(self, columns: list[str]) -> None:
         """Delete columns from DataFrame and tracking lists.
 
         Args:
@@ -751,16 +779,16 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "delete_channels",
-            {"columns": columns},
-            0.0,
-            end_time
+            description="delete_channels",
+            params={"columns": columns},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
         self.historyChanged.emit()
 
-    def duplicate_channels(self, mappings: Dict[str, str]) -> None:
+    def duplicate_channels(self, mappings: dict[str, str]) -> None:
         """Duplicate columns with new names.
 
         Args:
@@ -784,10 +812,10 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "duplicate_channels",
-            {"mappings": mappings},
-            0.0,
-            end_time
+            description="duplicate_channels",
+            params={"mappings": mappings},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
@@ -815,10 +843,10 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "derived",
-            {"name": name, "expr": expr},
-            0.0,
-            end_time
+            description="derived",
+            params={"name": name, "expr": expr},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()

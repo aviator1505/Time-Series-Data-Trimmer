@@ -10,7 +10,7 @@ and a minimal plugin/recipe system.
 
 Dependencies
 ------------
-pip install PyQt6 pyqtgraph pandas numpy scipy
+pip install PySide6 pyqtgraph pandas numpy scipy
 
 Run
 ---
@@ -37,9 +37,11 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+# Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
+# even if another Qt binding is installed in the environment.
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import pyqtgraph.exporters  # noqa: F401 - module provides exporters used dynamically
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 
 # Security: Patterns to block in plugin expressions
@@ -107,6 +109,7 @@ def validate_plugin_expression(expr: str, available_columns: List[str]) -> Tuple
 
     return True, ""
 
+from background import run_in_background
 from data_model import AnnotationSegment, DataModel, OperationRecord
 from dialogs import (
     AnnotationTable,
@@ -132,12 +135,13 @@ from plot2d import PlotController2D
 from plot3d import PlotController3D
 from plugin_system import PluginManager
 from project_manager import ProjectManager, load_signal_presets, save_signal_presets, load_ui_state, save_ui_state
+from theme import apply_theme, effective_scheme
 
 
 class ChannelManagerWidget(QtWidgets.QWidget):
     """Panel listing time/metadata/signals with show/hide checkboxes."""
 
-    channelToggled = QtCore.pyqtSignal()
+    channelToggled = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -296,7 +300,7 @@ class ChannelManagerWidget(QtWidgets.QWidget):
 class ChannelStylePanel(QtWidgets.QWidget):
     """Assign per-channel plot styles overriding the global plot style."""
 
-    styleChanged = QtCore.pyqtSignal(str, str)
+    styleChanged = QtCore.Signal(str, str)
 
     def __init__(self, style_map: Dict[str, str], parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -366,7 +370,7 @@ class OperationHistoryWidget(QtWidgets.QListWidget):
 
 
 class ProjectPanel(QtWidgets.QWidget):
-    trialSelected = QtCore.pyqtSignal(str)
+    trialSelected = QtCore.Signal(str)
 
     def __init__(self, project: ProjectManager, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -502,6 +506,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
         self.loaded_file_path: str | None = None
         self.plot2d = PlotController2D()
+        self.plot2d.set_style(dark=(effective_scheme(QtWidgets.QApplication.instance()) == "dark"))
         self.plot3d = PlotController3D()
         self.style_panel = ChannelStylePanel(
             {
@@ -806,7 +811,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_panel.refresh()
 
     def load_file(self, path: str) -> None:
-        self.data_model.load_csv(path)
+        """Parse the CSV on a worker thread, then adopt it on the UI thread."""
+        busy = QtWidgets.QProgressDialog(f"Loading {os.path.basename(path)}…", None, 0, 0, self)
+        busy.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        busy.setMinimumDuration(300)
+
+        def done(df: pd.DataFrame) -> None:
+            busy.close()
+            self.data_model.load_frame(df, path)
+            self._after_load(path)
+
+        def fail(exc: BaseException) -> None:
+            busy.close()
+            QtWidgets.QMessageBox.critical(
+                self, "Load Error",
+                f"Failed to load {os.path.basename(path)}:\n{type(exc).__name__}: {exc}"
+            )
+
+        run_in_background(DataModel.read_csv_frame, path, on_finished=done, on_error=fail)
+
+    def _after_load(self, path: str) -> None:
         self.loaded_file_path = path
         self.filter_engine.set_sample_rate(self.data_model.sample_rate)
         groups = self.data_model.channel_groups()
@@ -908,12 +932,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_preferences(self) -> None:
         dlg = PreferencesDialog(self.data_model.sample_rate, self)
         dlg.output_dir.setText(self.project.preferences.get("default_output_dir", ""))
+        ui_state = load_ui_state()
+        dlg.theme_combo.setCurrentText(ui_state.get("theme", "System"))
         if dlg.exec():
             vals = dlg.values()
             self.data_model.set_sample_rate(vals["fs"])
             self.filter_engine.set_sample_rate(vals["fs"])
             self.project.preferences["default_output_dir"] = vals["output_dir"]
             self.project.save()
+            self.apply_theme_preference(vals["theme"])
+
+    def apply_theme_preference(self, theme: str) -> None:
+        """Apply and persist the theme, restyling plots to match."""
+        app = QtWidgets.QApplication.instance()
+        scheme = apply_theme(app, theme)
+        self.plot2d.set_style(dark=(scheme == "dark"))
+        self.plot2d.refresh_plots()
+        ui_state = load_ui_state()
+        ui_state["theme"] = theme
+        save_ui_state(ui_state)
 
     def on_shortcuts(self) -> None:
         ShortcutDialog(self).exec()
@@ -1327,78 +1364,80 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_flag = params.pop("preview", False)
         df_current = self.data_model.get_dataframe()
 
-        # Progress indication for large datasets
-        row_count = len(df_current)
-        progress = None
-        if row_count > 10000 and not preview:
-            progress = QtWidgets.QProgressDialog(
-                "Applying filter...", "Cancel", 0, 100, self
-            )
-            progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(500)
-            progress.setValue(10)
-            QtWidgets.QApplication.processEvents()
+        # The filter math runs on a worker thread; the busy dialog keeps the
+        # window modal-but-responsive. Cancel drops the result when it lands.
+        busy = QtWidgets.QProgressDialog("Applying filter…", "Cancel", 0, 0, self)
+        busy.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        busy.setMinimumDuration(300)
 
-        try:
-            if progress:
-                progress.setValue(30)
-                QtWidgets.QApplication.processEvents()
-                if progress.wasCanceled():
-                    return
+        def done(df_new: pd.DataFrame) -> None:
+            busy.close()
+            try:
+                self._finish_filter(df_new, df_current, chans, filter_type, params,
+                                    selection, preview_flag)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error",
+                    f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
+                )
 
-            df_new = self.filter_engine.apply(
-                df_current, chans, filter_type, params, selection=selection
-            )
+        def fail(exc: BaseException) -> None:
+            busy.close()
+            if isinstance(exc, ValueError):
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error", f"Invalid filter parameters:\n{exc}"
+                )
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter Error",
+                    f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
+                )
 
-            if progress:
-                progress.setValue(70)
-                QtWidgets.QApplication.processEvents()
-                if progress.wasCanceled():
-                    return
+        job = run_in_background(
+            self.filter_engine.apply,
+            df_current, chans, filter_type, params,
+            selection=selection,
+            on_finished=done, on_error=fail,
+        )
+        busy.canceled.connect(job.cancel)
 
-            if filter_type == "resample":
-                self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
-            if preview_flag and chans:
-                ch = chans[0]
-                time = df_new["normalized_time"].to_numpy()
-                orig_series = df_current[ch]
-                orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
-                filt = df_new[ch].to_numpy()
-                orig = orig_series.to_numpy()
-                if len(time) != len(orig) or len(time) != len(filt):
-                    try:
-                        # interpolate original onto new time base for preview
-                        orig = np.interp(time, orig_time, orig_series)
-                    except Exception:
-                        # last resort: truncate to common minimum length
-                        n = min(len(time), len(orig), len(filt))
-                        time = time[:n]
-                        orig = orig[:n]
-                        filt = filt[:n]
-                prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
-                if not prev_dlg.exec():
-                    return
+    def _finish_filter(
+        self,
+        df_new: pd.DataFrame,
+        df_current: pd.DataFrame,
+        chans: List[str],
+        filter_type: str,
+        params: Dict,
+        selection: Optional[Tuple[float, float]],
+        preview_flag: bool,
+    ) -> None:
+        """UI-thread continuation of apply_filters_from_panel."""
+        if filter_type == "resample":
+            self.data_model.set_sample_rate(params.get("target_fs", self.data_model.sample_rate))
+        if preview_flag and chans:
+            ch = chans[0]
+            time = df_new["normalized_time"].to_numpy()
+            orig_series = df_current[ch]
+            orig_time = df_current["normalized_time"].to_numpy() if "normalized_time" in df_current else np.arange(len(orig_series))
+            filt = df_new[ch].to_numpy()
+            orig = orig_series.to_numpy()
+            if len(time) != len(orig) or len(time) != len(filt):
+                try:
+                    # interpolate original onto new time base for preview
+                    orig = np.interp(time, orig_time, orig_series)
+                except Exception:
+                    # last resort: truncate to common minimum length
+                    n = min(len(time), len(orig), len(filt))
+                    time = time[:n]
+                    orig = orig[:n]
+                    filt = filt[:n]
+            prev_dlg = FilterPreviewDialog(time, orig, filt, ch, self)
+            if not prev_dlg.exec():
+                return
 
-            if progress:
-                progress.setValue(90)
-                QtWidgets.QApplication.processEvents()
-
-            start = selection[0] if selection else 0.0
-            end = selection[1] if selection else df_new["normalized_time"].max()
-            self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
-
-            if progress:
-                progress.setValue(100)
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(
-                self, "Filter Error",
-                f"Invalid filter parameters:\n{e}"
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self, "Filter Error",
-                f"Failed to apply filter:\n{type(exc).__name__}: {exc}"
-            )
+        start = selection[0] if selection else 0.0
+        end = selection[1] if selection else df_new["normalized_time"].max()
+        self.data_model.apply_dataframe(df_new, "filter", start, end, {"channels": chans, "filter_type": filter_type, **params})
 
     def save_recipe(self) -> None:
         if not self.data_model.history:
@@ -1409,7 +1448,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not path.lower().endswith(".json"):
             path += ".json"
-        data = {"operations": [rec.__dict__ for rec in self.data_model.history]}
+        data = {"operations": [rec.model_dump() for rec in self.data_model.history]}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         self.statusBar().showMessage(f"Recipe saved to {path}")
@@ -2404,9 +2443,9 @@ class MainWindow(QtWidgets.QMainWindow):
             state = {
                 "schema_version": 2,  # Version 2 includes history and sample_rate
                 "data": self.data_model.get_dataframe().to_dict(orient="list") if self.data_model.df is not None else None,
-                "annotations": [ann.__dict__ for ann in self.data_model.annotations],
+                "annotations": [ann.model_dump() for ann in self.data_model.annotations],
                 "deletions": self.data_model.deletions,
-                "history": [rec.__dict__ for rec in self.data_model.history],
+                "history": [rec.model_dump() for rec in self.data_model.history],
                 "sample_rate": self.data_model.sample_rate,
             }
 
@@ -2506,6 +2545,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    apply_theme(app, load_ui_state().get("theme", "System"))
     pg.setConfigOptions(antialias=True)
     window = MainWindow()
     window.show()

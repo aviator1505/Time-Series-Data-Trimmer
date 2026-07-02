@@ -1,0 +1,53 @@
+{
+  "annotations": [
+    {
+      "start": 0.1,
+      "end": 0.3,
+      "label": "saccade",
+      "track": "gaze",
+      "color": "#e15759",
+      "id": 101,
+      "episode_index": null
+    },
+    {
+      "start": 0.4,
+      "end": 0.6,
+      "label": "fixation",
+      "track": "default",
+      "color": "#4e79a7",
+      "id": 102,
+      "episode_index": 3
+    }
+  ],
+  "deletions": [
+    {
+      "start": 0.05,
+      "end": 0.08
+    },
+    {
+      "start": 0.7,
+      "end": 0.75
+    }
+  ],
+  "history": [
+    {
+      "description": "filter:butter_lowpass",
+      "params": {
+        "cutoff": 6.0,
+        "order": 4,
+        "channels": [
+          "gaze_x"
+        ]
+      },
+      "start": 0.0,
+      "end": 0.82
+    },
+    {
+      "description": "delete_range",
+      "params": {},
+      "start": 0.05,
+      "end": 0.08
+    }
+  ],
+  "sample_rate": 120.0
+}

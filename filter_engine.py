@@ -1,7 +1,7 @@
 """Filter engine for time-series operations."""
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -22,7 +22,7 @@ class FilterEngine:
         self.sample_rate = float(fs)
 
     # ------------------------------------------------------------------
-    def apply(self, df: pd.DataFrame, channels: Iterable[str], filter_type: str, params: Dict, selection: Optional[Tuple[float, float]] = None) -> pd.DataFrame:
+    def apply(self, df: pd.DataFrame, channels: Iterable[str], filter_type: str, params: dict, selection: tuple[float, float] | None = None) -> pd.DataFrame:
         channels = list(channels)
         if not channels:
             return df
@@ -356,7 +356,7 @@ class FilterEngine:
 
     def quaternion_to_euler(
         self, df: pd.DataFrame, qw_col: str, qx_col: str, qy_col: str, qz_col: str
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Convert quaternion columns to Euler angles (yaw, pitch, roll) in degrees.
 
         Uses ZYX (aerospace) convention.
@@ -404,7 +404,7 @@ class FilterEngine:
         child_qx: str,
         child_qy: str,
         child_qz: str,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute relative orientation between two quaternion-defined segments.
 
         Returns the child orientation expressed in the parent frame.
@@ -455,7 +455,7 @@ class FilterEngine:
         child_qx: str,
         child_qy: str,
         child_qz: str,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute relative orientation between two quaternion-defined segments.
 
         This is an alias for quaternion_relative() providing a more intuitive name.
@@ -476,7 +476,7 @@ class FilterEngine:
         )
 
 
-def available_filters() -> List[str]:
+def available_filters() -> list[str]:
     return [
         "moving_average",
         "median",
