@@ -545,6 +545,41 @@ class CoreDataModel:
         self._notify_status(f"Loaded annotations from {path}")
 
     # ------------------------------------------------------------------
+    # Session bundles (.tsdt)
+    # ------------------------------------------------------------------
+    def save_session(
+        self, path: str, ui_state: dict | None = None, source: str | None = None
+    ) -> None:
+        """Save the complete session as a portable .tsdt bundle."""
+        from tsdt_core import session_io
+
+        session_io.save_session(path, self, ui_state=ui_state, source=source)
+        self._notify_status(f"Saved session to {os.path.basename(path)}")
+
+    def load_session(self, path: str) -> dict:
+        """Restore a .tsdt bundle; returns its ui_state dict for the caller."""
+        from tsdt_core import session_io
+
+        session = session_io.load_session(path)
+        self.df = session.df
+        self.original_df = session.original_df
+        self.annotations = session.annotations
+        self.deletions = session.deletions
+        self.history = session.history
+        self.sample_rate = session.sample_rate
+        self.preserve_timing_gaps = session.preserve_timing_gaps
+        self._classify_columns(self.df)
+        self._ensure_bad_mask()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._id_counter = max((a.id for a in self.annotations), default=0) + 1
+        self._notify_data_changed()
+        self._notify_annotations_changed()
+        self._notify_history_changed()
+        self._notify_status(f"Loaded session from {os.path.basename(path)}")
+        return session.ui_state
+
+    # ------------------------------------------------------------------
     # Episode column conversion (annotations <-> CSV columns)
     # ------------------------------------------------------------------
     def _parse_annotation_label(self, label: str) -> tuple[str, str]:
