@@ -32,6 +32,7 @@ dev = [
 tsdt = "main:main"
 
 [tool.setuptools]
+packages = ["tsdt_core"]
 py-modules = [
     "main",
     "data_model",
@@ -41,6 +42,8 @@ py-modules = [
     "dialogs",
     "project_manager",
     "plugin_system",
+    "background",
+    "theme",
 ]
 
 [tool.pytest.ini_options]

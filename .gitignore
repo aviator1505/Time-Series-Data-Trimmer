@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .autosave_session.json
+.autosave_session.tsdt
 dist/
 build/
 *.egg-info/

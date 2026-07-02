@@ -32,9 +32,6 @@ class InteractionMode(Enum):
     EDIT = auto()         # Editing existing annotations
 
 import re
-import shutil
-import tempfile
-
 import numpy as np
 import pandas as pd
 # Import the Qt binding before pyqtgraph so pyqtgraph binds to PySide6
@@ -503,7 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plugins = PluginManager()
         self.frames: Dict[str, Dict] = {"lab": {"parent": "", "offset": 0.0}}
         self.mapping: Dict[str, Dict[str, str]] = {}
-        self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
+        self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.tsdt")
+        self.legacy_autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
         self.loaded_file_path: str | None = None
         self.plot2d = PlotController2D()
         self.plot2d.set_style(dark=(effective_scheme(QtWidgets.QApplication.instance()) == "dark"))
@@ -674,6 +672,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menus(self) -> None:
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
+        file_menu.addAction("Open session (.tsdt)…", self.on_open_session)
+        act = file_menu.addAction("Save session (.tsdt)…", self.on_save_session)
+        act.setShortcut(QtGui.QKeySequence("Ctrl+Shift+S"))
+        file_menu.addSeparator()
         act = file_menu.addAction("Open CSV…", self.on_open_csv)
         act.setShortcut(QtGui.QKeySequence("Ctrl+O"))
         act = file_menu.addAction("Save cleaned CSV…", self.on_save_clean)
@@ -810,6 +812,55 @@ class MainWindow(QtWidgets.QMainWindow):
                 t.status = "loaded"
         self.project_panel.refresh()
 
+    def on_save_session(self) -> None:
+        if self.data_model.df is None:
+            self.statusBar().showMessage("Load data before saving a session")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save session", "", "TSDT session (*.tsdt)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".tsdt"):
+            path += ".tsdt"
+        try:
+            self.data_model.save_session(
+                path,
+                source=os.path.basename(self.loaded_file_path or ""),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save session:\n{type(exc).__name__}: {exc}"
+            )
+
+    def on_open_session(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open session", "", "TSDT session (*.tsdt)"
+        )
+        if not path:
+            return
+        self._load_session_file(path)
+
+    def _load_session_file(self, path: str) -> None:
+        try:
+            self.data_model.load_session(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Open failed",
+                f"Could not open session:\n{type(exc).__name__}: {exc}"
+            )
+            return
+        self.loaded_file_path = path
+        self.filter_engine.set_sample_rate(self.data_model.sample_rate)
+        groups = self.data_model.channel_groups()
+        self.channel_manager.populate(
+            self.data_model.time_columns, self.data_model.metadata_columns, groups
+        )
+        self.update_channels()
+        self._update_episode_overlay()
+        self._on_annotations_changed()
+
     def load_file(self, path: str) -> None:
         """Parse the CSV on a worker thread, then adopt it on the UI thread."""
         busy = QtWidgets.QProgressDialog(f"Loading {os.path.basename(path)}…", None, 0, 0, self)
@@ -818,6 +869,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(df: pd.DataFrame) -> None:
             busy.close()
+            report = df.attrs.get("ingest_report")
+            # Confirm with the user whenever ingestion made a nontrivial
+            # decision (delimiter/encoding, time conversion, coercion)
+            if report is not None and (report.summary() or report.notes):
+                from dialogs import ImportPreviewDialog
+
+                dlg = ImportPreviewDialog(df, report, self)
+                if not dlg.exec():
+                    self.statusBar().showMessage("Import cancelled")
+                    return
+                new_df = dlg.result_frame()
+                new_df.attrs["ingest_report"] = report
+                df = new_df
             self.data_model.load_frame(df, path)
             self._after_load(path)
 
@@ -2439,32 +2503,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_model.annotate(s, e, label=label, track="suggestion", color="#ffaa00")
 
     def autosave(self) -> None:
+        if self.data_model.df is None:
+            return
         try:
-            state = {
-                "schema_version": 2,  # Version 2 includes history and sample_rate
-                "data": self.data_model.get_dataframe().to_dict(orient="list") if self.data_model.df is not None else None,
-                "annotations": [ann.model_dump() for ann in self.data_model.annotations],
-                "deletions": self.data_model.deletions,
-                "history": [rec.model_dump() for rec in self.data_model.history],
-                "sample_rate": self.data_model.sample_rate,
-            }
-
-            # Atomic write: write to temp file, then rename
-            autosave_dir = os.path.dirname(self.autosave_path) or "."
-            fd, temp_path = tempfile.mkstemp(suffix=".json", dir=autosave_dir)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(state, f)
-                # Atomic rename (works on same filesystem)
-                shutil.move(temp_path, self.autosave_path)
-            except Exception:
-                # Clean up temp file on failure
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-                raise
-
+            # .tsdt bundles are Arrow-based and atomic; far faster than the
+            # old JSON dump for large frames
+            self.data_model.save_session(
+                self.autosave_path,
+                source=os.path.basename(self.loaded_file_path or ""),
+            )
         except PermissionError:
             self.statusBar().showMessage("Autosave failed: Permission denied", 5000)
         except OSError as e:
@@ -2474,7 +2521,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Autosave failed", 5000)
 
     def prompt_restore_autosave(self) -> None:
-        if not os.path.isfile(self.autosave_path):
+        has_tsdt = os.path.isfile(self.autosave_path)
+        has_legacy = os.path.isfile(self.legacy_autosave_path)
+        if not has_tsdt and not has_legacy:
             return
         reply = QtWidgets.QMessageBox.question(
             self,
@@ -2484,8 +2533,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if has_tsdt:
+            self._load_session_file(self.autosave_path)
+            self.statusBar().showMessage("Restored autosave session")
+            return
+        # Legacy JSON autosave from older app versions
         try:
-            with open(self.autosave_path, "r", encoding="utf-8") as f:
+            with open(self.legacy_autosave_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
             data_dict = state.get("data")
             if data_dict:

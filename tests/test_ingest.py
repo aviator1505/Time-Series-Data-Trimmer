@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ingest import smart_read, sniff_csv
+from tsdt_core.ingest import smart_read, sniff_csv
 
 
 def _write(tmp_path, text: str, name: str = "data.csv", encoding: str = "utf-8") -> str:
@@ -210,3 +210,48 @@ def test_datamodel_load_csv_uses_smart_ingest(tmp_path):
     assert dm.sample_rate == pytest.approx(100.0, abs=0.1)
     assert dm.ingest_report is not None
     assert dm.ingest_report.time_unit == "ms"
+
+
+# ---------------------------------------------------------------------------
+# Explicit time-axis override (import preview dialog backend)
+# ---------------------------------------------------------------------------
+
+def test_apply_time_axis_explicit_ms(tmp_path):
+    from tsdt_core.ingest import IngestReport, apply_time_axis
+
+    df = pd.DataFrame({"t": [0, 10, 20, 30], "gaze_x": [1.0, 2.0, 3.0, 4.0]})
+    report = IngestReport()
+    out = apply_time_axis(df, "t", "ms", report=report)
+    assert out["normalized_time"].tolist() == pytest.approx([0.0, 0.01, 0.02, 0.03])
+    assert report.time_column == "t"
+    assert report.time_unit == "ms"
+    # input frame untouched
+    assert "normalized_time" not in df.columns
+
+
+def test_apply_time_axis_auto_epoch():
+    from tsdt_core.ingest import apply_time_axis
+
+    t0 = 1_750_000_000_000
+    df = pd.DataFrame({"stamp_col": [t0, t0 + 10, t0 + 20], "x": [1, 2, 3]})
+    out = apply_time_axis(df, "stamp_col", "auto")
+    assert out["normalized_time"].tolist() == pytest.approx([0.0, 0.01, 0.02])
+
+
+def test_apply_time_axis_datetime_strings():
+    from tsdt_core.ingest import apply_time_axis
+
+    df = pd.DataFrame({
+        "when": ["2026-07-02 10:00:00", "2026-07-02 10:00:01", "2026-07-02 10:00:02"],
+        "x": [1, 2, 3],
+    })
+    out = apply_time_axis(df, "when", "datetime")
+    assert out["normalized_time"].tolist() == pytest.approx([0.0, 1.0, 2.0])
+
+
+def test_apply_time_axis_bad_column():
+    from tsdt_core.ingest import apply_time_axis
+
+    df = pd.DataFrame({"x": [1.0, 2.0]})
+    with pytest.raises(KeyError):
+        apply_time_axis(df, "missing", "s")

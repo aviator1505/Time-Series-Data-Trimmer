@@ -1,140 +1,195 @@
 # Time-Series Data Trimmer (Kinematics Annotation Studio)
 
-> A scientific time-series annotation & cleaning workbench for gaze / kinematics / IMU CSV datasets featuring no‑code segmentation, filtering, annotation, 2D + 3D synchronized visualization, multi‑trial project management, recipes & plugins, autosave, and export utilities.
+> A scientific time-series annotation & cleaning workbench for gaze / kinematics / IMU datasets — no-code segmentation, filtering, annotation, 2D + 3D synchronized visualization, adaptive ingestion, portable `.tsdt` session bundles, multi-trial projects, recipes & plugins, and export utilities.
+
+[![CI](https://img.shields.io/badge/CI-pytest%20%2B%20ruff-informational)](.github/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
+
 ## Table of Contents
-1. Overview
-2. Core Concepts & Benefits
-3. Feature Matrix
-4. Architecture Overview
-5. Installation
-6. Quick Start (5‑Minute Tour)
-7. GUI Walkthrough
-8. Data Handling & Column Classification
-9. Cleaning Operations (Delete / Mask / Suggestions)
-10. Filters & Signal Processing
-11. Annotation Workflow
-12. 2D Plotting Controller
-13. 3D Visualization & Coordinate Frames
-14. Projects, Trials, Recipes & Batch Processing
-15. Plugins & Derived Channels
-16. Autosave & Session Recovery
-17. Undo / Redo & Operation History
-18. Exporting (Data & Figures)
-19. Programmatic API Usage
-20. Testing
-21. Performance Characteristics
-22. Limitations & Transparency
-23. Suggested Roadmap / Next Steps
-24. Contributing Guidelines
-25. License
-26. FAQ / Troubleshooting
+1. [Overview](#1-overview)
+2. [Core Concepts & Benefits](#2-core-concepts--benefits)
+3. [Feature Matrix](#3-feature-matrix)
+4. [Architecture](#4-architecture)
+5. [Installation](#5-installation)
+6. [Quick Start (5-Minute Tour)](#6-quick-start-5-minute-tour)
+7. [GUI Walkthrough](#7-gui-walkthrough)
+8. [Adaptive Ingestion](#8-adaptive-ingestion)
+9. [Cleaning Operations (Delete / Mask / Suggestions)](#9-cleaning-operations)
+10. [Filters & Signal Processing](#10-filters--signal-processing)
+11. [Annotation Workflow](#11-annotation-workflow)
+12. [2D Plotting Controller](#12-2d-plotting-controller)
+13. [3D Visualization & Coordinate Frames](#13-3d-visualization--coordinate-frames)
+14. [Projects, Trials, Recipes & Batch Processing](#14-projects-trials-recipes--batch-processing)
+15. [Plugins & Derived Channels](#15-plugins--derived-channels)
+16. [Session Bundles (.tsdt) & Autosave](#16-session-bundles-tsdt--autosave)
+17. [Undo / Redo & Operation History](#17-undo--redo--operation-history)
+18. [Exporting (Data & Figures)](#18-exporting-data--figures)
+19. [Programmatic API Usage](#19-programmatic-api-usage)
+20. [Theming](#20-theming)
+21. [Testing](#21-testing)
+22. [Packaging & Distribution](#22-packaging--distribution)
+23. [Performance Characteristics](#23-performance-characteristics)
+24. [Limitations & Transparency](#24-limitations--transparency)
+25. [Roadmap](#25-roadmap)
+26. [Contributing](#26-contributing)
+27. [License](#27-license)
+28. [FAQ / Troubleshooting](#28-faq--troubleshooting)
 
 ---
+
 ## 1. Overview
-This application accelerates exploratory cleaning and annotation of multichannel time‑series signals (e.g., gaze heading, inertial headings, body part positions). It targets researchers who want:
-- Rapid manual or semi‑automatic segmentation of artefacts (blinks, spikes, NaNs).
+
+This application accelerates exploratory cleaning and annotation of multichannel time-series signals (e.g., gaze heading, inertial headings, body-part positions). It targets researchers who want:
+
+- Rapid manual or semi-automatic segmentation of artefacts (blinks, spikes, NaNs).
 - Consistent annotation of behavioral events (episodes, actions, states).
 - Lightweight filtering (smoothing, detrend, normalization, resample) without scripting.
 - Visual synchronization of channels in 2D with an optional 3D spatial representation.
-- Reproducible batch re‑application of prior cleaning steps via “recipes” or JSON plugins.
+- Files that "just load" — delimiter, encoding, and time-unit detection happen automatically instead of requiring a fixed CSV schema.
+- Reproducible batch re-application of prior cleaning steps via recipes or JSON plugins.
+- Sessions that move between machines as a single portable file.
 
-You can treat it as a GUI front‑end to a small set of well‑defined data transformation primitives packaged around a pandas DataFrame.
+The GUI is a thin PySide6 layer over `tsdt_core`, a headless engine built on pandas. `tsdt_core` has no Qt dependency and is directly usable from scripts, notebooks, or a future CLI.
 
 ---
+
 ## 2. Core Concepts & Benefits
+
 | Concept | Explanation | Benefit |
 |---------|-------------|---------|
-| `DataModel` | Wraps a pandas DataFrame with undo/redo, annotation state, deletion collapse, classification. | Safe experimentation: full snapshots retained. |
-| Normalized Time | Column `normalized_time` maintained as monotonically increasing seconds, regenerated after deletions. | Downstream tools assume contiguous, clean time base. |
-| Annotations | Structured segments (`start`, `end`, `label`, `track`, `color`, `id`). | Rich semantic tagging & episode overlay. |
-| Deletions vs Bad Segments | Hard removal collapses timeline; marking bad retains samples via flag `is_bad_segment`. | Choose reversible vs irreversible cleaning. |
-| Filter Engine | Uniform API for multiple filters with optional SciPy acceleration fallback. | Consistent param surface; preview support. |
+| `CoreDataModel` (`tsdt_core/core.py`) | Wraps a pandas DataFrame with diff-based undo/redo, annotation state, deletion collapse, classification. Qt-free. | Reusable outside the GUI; cheap undo. |
+| `DataModel` (`data_model.py`) | Thin `QObject` adapter over `CoreDataModel` — turns its observer hooks into Qt signals. | UI code stays decoupled from data logic. |
+| Adaptive ingestion (`tsdt_core/ingest.py`) | Sniffs delimiter/encoding, detects the time axis and its unit, coerces mostly-numeric text columns, reports what it did. | Loads real-world messy exports without manual preprocessing. |
+| Normalized Time | Column `normalized_time`, monotonically increasing seconds, rebuilt after deletions. | Downstream tools assume a contiguous, clean time base. |
+| Annotations | Structured segments (`start`, `end`, `label`, `track`, `color`, `id`), validated with Pydantic. | Rich semantic tagging & episode overlay. |
+| Deletions vs. Bad Segments | Hard removal collapses the timeline; marking bad retains samples via an `is_bad_segment` flag. | Choose reversible vs. irreversible cleaning. |
+| Diff-based Undo (`tsdt_core/undo.py`) | Each mutation pushes only its inverse (changed columns, a deleted row block, a rename) — not a full DataFrame copy. | Annotating is near-free; undo stack stays small even on large files. |
+| `.tsdt` session bundles | Single ZIP file: current + original data (Arrow/zstd), annotations, history, UI state, versioned manifest. | Portable sessions — move a whole analysis between installations as one file. |
+| Filter Engine | Uniform API for many filters with optional SciPy acceleration and pure-NumPy fallbacks. | Consistent parameter surface; preview before commit. |
 | Plugins & Recipes | JSON description of operations or derived expressions. | Reproducibility; batch automation. |
-| Project Manager | Aggregates many trial CSV paths plus preferences and recipes. | Multi‑trial study workflow. |
+| Project Manager | Aggregates many trial CSV paths plus preferences and recipes. | Multi-trial study workflow. |
 | 2D + 3D Controllers | Linked time cursor & selection; optional mapping to spatial anchors & heading arrows. | Multimodal interpretation of motor/gaze signals. |
-| Autosave | Periodic `.autosave_session.json` snapshot of data + annotations + history. | Crash resilience; restore prompt on launch. |
-| Suggestions | Simple spike / NaN segment detection on first signal channel. | Speeds manual curation with quick accept. |
+| Background jobs (`background.py`) | CSV parsing and filter application run on a `QThreadPool` worker. | The window stays responsive on large files. |
 
 ---
+
 ## 3. Feature Matrix
+
 | Category | Implemented | Notes |
 |----------|-------------|-------|
-| Load CSV | ✅ | Automatic NaN normalization; classifies columns.
-| Column Grouping | ✅ | Heuristic grouping into Gaze, Head, Torso, Feet, Chair, GMM, Other.
-| Undo/Redo | ✅ | Full DataFrame copy each operation.
-| Selection / Drag | ✅ | Linear region drag; annotation drag updates alive.
-| Delete / Mask | ✅ | Delete collapses time; Mark bad sets boolean mask.
-| Annotations | ✅ | Color, track, label; editing & context menu.
-| Episode Overlay | ✅ | Auto‑generated from columns `episode_index`, `episode_type`, optional `episode_state`.
-| Filters | ✅ | Moving average, median, Savitzky–Golay, Butterworth low/band, detrend, resample, interpolate, derivative, integrate, z‑score, percent, moving RMS, absolute.
-| Filter Preview | ✅ | First selected channel preview before commit.
-| Resampling | ✅ | Linear interpolation, updates sampling rate globally.
-| Plugins | ✅ | JSON operations (filter / derived expression).
-| Derived Channels | ✅ | Expression via `pd.eval` using existing columns.
-| Recipes | ✅ | Saved operation history re‑apply.
-| Project Management | ✅ | Trials table; status updates; batch recipe application.
-| 2D Plotting | ✅ | Overlay or per‑channel stacked; selection & cursor linking.
-| 3D Plotting | ✅ | Mapped (x,y,z) columns; heading arrows; fallback star plot.
-| Coordinate Frames | ✅ | Frames with heading offsets; calibration wizard.
-| Calibration Wizard | ✅ | Mean heading offset between channels over a window.
-| Suggestions (Spike/Nan) | ✅ | Threshold derivative heuristic.
-| Autosave | ✅ | Timed + on key events.
-| Figure Export | ✅ | PNG/SVG/PDF using pyqtgraph exporters / QPdfWriter.
-| Operation History | ✅ | Rolling list with description & param snapshots.
-| Keyboard Shortcuts | ✅ | Common operations (D/M/A/U/R/Space/Arrows).
-| Testing | Limited | Only filter engine tests included.
+| Adaptive file loading | ✅ | Delimiter/encoding sniffing, time-unit detection (epoch s/ms/µs/ns, ISO datetime, name hints), numeric coercion report, Parquet/Feather import. |
+| Import preview | ✅ | Shown when ingestion makes a nontrivial decision; lets you override the time column/unit before the file is adopted. |
+| Column Grouping | ✅ | Heuristic grouping into Gaze, Head, Torso, Feet, Chair, Workspace, Screen, Fixation, Position, Orientation, Other. |
+| Undo/Redo | ✅ | Diff-based — each entry stores only its inverse payload; full snapshot only as a fallback (e.g., resample). |
+| Selection / Drag | ✅ | Linear-region drag; annotation drag updates live. |
+| Delete / Mask | ✅ | Delete collapses time; Mark Bad sets a boolean mask. |
+| Annotations | ✅ | Color, track, label; editing & context menu. |
+| Episode Overlay | ✅ | Auto-generated from columns `episode_index`, `episode_type`, optional `episode_state`. |
+| Filters | ✅ | Moving average, median, Savitzky–Golay, Butterworth low/band, detrend, resample, interpolate, derivative, integrate, z-score, percent-normalize, moving RMS, absolute, polarity/reference inversion, mirror, circular flip, constant offset. |
+| Filter Preview | ✅ | First selected channel preview before commit; runs off the UI thread. |
+| Non-blocking I/O | ✅ | CSV load and filter application run on a worker thread via `background.py`. |
+| Resampling | ✅ | Linear interpolation; updates sampling rate globally. |
+| Plugins | ✅ | JSON operations (filter / derived expression); pattern-validated for safety. |
+| Derived Channels | ✅ | Expression via `pd.eval` using existing columns. |
+| Recipes | ✅ | Saved operation history, re-applicable across trials. |
+| Project Management | ✅ | Trials table; status updates; batch recipe application. |
+| 2D Plotting | ✅ | Overlay or per-channel stacked; selection & cursor linking; light/dark backgrounds. |
+| 3D Plotting | ✅ | Mapped `(x, y, z)` columns; heading arrows; fallback star plot. |
+| Coordinate Frames | ✅ | Frames with heading offsets; calibration wizard. |
+| Suggestions (Spike/NaN) | ✅ | Threshold-derivative heuristic. |
+| `.tsdt` session bundles | ✅ | Portable single-file save/load (Open/Save session menu, `Ctrl+Shift+S`). |
+| Autosave | ✅ | Writes `.autosave_session.tsdt` every 30s; legacy `.autosave_session.json` still restorable. |
+| Figure Export | ✅ | PNG/SVG/PDF via pyqtgraph exporters / `QPdfWriter`. |
+| Operation History | ✅ | Rolling list with description & param snapshots. |
+| Theming | ✅ | System / Light / Dark, no third-party theme dependency. |
+| Keyboard Shortcuts | ✅ | `D`/`M`/`A`/`U`/`R`/`Space`/arrows; see Tools → Keyboard Shortcuts in-app. |
+| Packaging | ✅ | `pyproject.toml`, PyInstaller spec, per-OS build workflow. |
+| Testing | ✅ | ~300 pytest cases: data model, undo invariants, ingestion matrix, session round-trips, plugin security, offscreen Qt smoke tests. |
+| CI | ✅ | GitHub Actions: pytest + ruff on Python 3.11/3.12. |
 
 ---
-## 4. Architecture Overview
+
+## 4. Architecture
+
 ```text
-main.py
-  ├─ DataModel (data_model.py)            # Core state, undo/redo, annotations
-  ├─ FilterEngine (filter_engine.py)      # Signal transforms
-  ├─ PlotController2D (plot2d.py)         # Multi-channel interactive plots
-  ├─ PlotController3D (plot3d.py)         # Spatial view & heading arrows
-  ├─ PluginManager (plugin_system.py)     # JSON plugin discovery
-  ├─ ProjectManager (project_manager.py)  # Multi-trial & recipes
-  ├─ Dialogs (dialogs.py)                 # Reusable GUI forms
-  └─ Autosave / Suggestions / Playback    # Session resilience & assistance
-```
-Data flow: CSV → `DataModel` classification → user operations update DataFrame → signals emitted → plot controllers refresh → history recorded → recipes/plugins persist transformations.
+tsdt_core/              # HEADLESS ENGINE — no Qt imports allowed
+  core.py                 CoreDataModel: DataFrame + diff-undo/redo, annotations,
+                           deletions, classification; _notify_* observer hooks
+  models.py                Pydantic v2: AnnotationSegment, OperationRecord
+  undo.py                   UndoEntry: per-operation inverse payloads
+  ingest.py                 smart_read(): delimiter/encoding sniffing, time-unit
+                             detection, numeric coercion, IngestReport
+  session_io.py              .tsdt bundles: Arrow frames + JSON metadata in a ZIP
 
-Undo/redo: Each mutation uses `_push_state()` to capture a deep copy of DataFrame + annotations + deletions + history before applying changes.
+main.py                # Orchestrator: wires DataModel, FilterEngine, ProjectManager,
+                          PlotController2D/3D, dialogs; Qt signals route through here
+data_model.py           # Thin Qt adapter: DataModel(QObject, CoreDataModel)
+background.py           # QThreadPool workers for CSV load & filter apply
+theme.py                # Fusion + System/Light/Dark color schemes
+filter_engine.py        # Signal processing primitives (SciPy + NumPy fallbacks)
+plot2d.py               # PlotController2D: pyqtgraph multichannel time-series
+plot3d.py               # PlotController3D: pyqtgraph.opengl spatial view
+project_manager.py      # Multi-trial projects: trials, recipes, preferences
+plugin_system.py        # PluginManager: JSON operation sequences from plugins/
+dialogs.py              # PySide6 forms, including ImportPreviewDialog
+tsdt.spec               # PyInstaller build definition
+tools/benchmark_undo.py # Undo-cost benchmark
+```
+
+**Data flow:**
+1. File → `smart_read()` on a worker thread → `IngestReport` → optional `ImportPreviewDialog` → `DataModel.load_frame()` on the UI thread.
+2. User operation → `CoreDataModel` mutation method → diff-based undo entry pushed.
+3. DataFrame update → `_notify_*` hook → Qt signal → `PlotController2D/3D.refresh()`.
+4. Operation recorded in history → available for recipe generation.
+5. Autosave writes `.autosave_session.tsdt` every 30 seconds.
+
+**Qt/headless boundary:** `tsdt_core/` never imports Qt — a test (`tests/test_undo_diff.py` and friends import it directly) asserts it runs with PySide6 absent from `sys.modules`. All UI-facing behavior flows through the `_notify_*` observer hooks that `data_model.DataModel` overrides to emit signals. This means the entire data engine — ingestion, editing, undo, session I/O — is usable from a plain Python script or a Jupyter notebook with zero GUI dependencies.
 
 ---
+
 ## 5. Installation
+
 ### Prerequisites
-- Python 3.10+ recommended
-- Optional: SciPy for real Butterworth & Savitzky–Golay implementations (fallbacks provided otherwise).
+- Python 3.11 or 3.12
+- Optional: SciPy for the true Butterworth & Savitzky–Golay implementations (pure-NumPy fallbacks are used automatically otherwise — already included via `pyproject.toml`).
 
 ### Steps
-```powershell
-# (Windows PowerShell example)
+```bash
 python -m venv .venv
-. .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+source .venv/bin/activate        # Windows: . .venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
 python main.py
 ```
-If SciPy install fails (e.g., no native wheels), the application still runs with graceful fallbacks.
+
+All dependencies are pinned in `pyproject.toml` (`PySide6-Essentials`, `pyqtgraph`, `pandas`, `numpy`, `scipy`, `pydantic`, `pyarrow`, `charset-normalizer`; dev extras add `pytest`, `pytest-qt`, `ruff`). `requirements.txt` is kept as a quick-start alternative to `pip install -e .`.
+
+On Linux you may need the underlying Qt platform libraries if they aren't already present:
+```bash
+sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0
+```
 
 ---
-## 6. Quick Start (5‑Minute Tour)
+
+## 6. Quick Start (5-Minute Tour)
+
 1. Launch with `python main.py`.
-2. File → Open CSV… (use `8_1_P13_Stand_45.csv` for a smoke test).
+2. File → Open CSV… (use `8_1_P13_Stand_45.csv` for a smoke test). Ingestion runs in the background; if it had to make a nontrivial decision (odd delimiter, time-unit conversion, coerced columns) you'll see an import preview before the file is adopted.
 3. Toggle channels in the Channel Manager; optionally switch to overlay mode.
-4. Drag across a time interval to select; press:
-   - `D` delete, `M` mark bad, `A` annotate.
-5. Tools → Filters: pick channels & a preset, Preview → Apply.
-6. Inspect annotations; edit by double‑clicking or context menu.
-7. Enable 3D via Tools → 3D mapping… (enter x,y,z columns).
-8. Export cleaned CSV or figure (File → Save / Export figure…).
-9. Save annotations & optionally build a recipe from history.
-10. Reopen later; autosave offers restoration.
+4. Drag across a time interval to select; press `D` to delete, `M` to mark bad, `A` to annotate.
+5. Tools → Filters: pick channels & a preset, Preview → Apply (runs off the UI thread on large files).
+6. Inspect annotations; edit by double-clicking or via the context menu.
+7. Enable 3D via Tools → 3D mapping… (enter x, y, z columns).
+8. File → Save session (`Ctrl+Shift+S`) to write a portable `.tsdt` bundle — or export a cleaned CSV / figure.
+9. Build a recipe from the operation history for batch reuse across trials.
+10. Reopen later; autosave offers restoration from `.autosave_session.tsdt`.
 
 ---
+
 ## 7. GUI Walkthrough
+
 | Region | Purpose |
 |--------|---------|
 | Toolbar | Playback controls, speed, overlay toggle, annotation mode, 3D visibility. |
@@ -144,98 +199,111 @@ If SciPy install fails (e.g., no native wheels), the application still runs with
 | Annotations Dock | Table view of all segments; selecting jumps focus; edit & delete. |
 | Operation History Dock | Chronological list of operations with parameter snapshots. |
 | Project Dock | Manages multiple trial CSVs with status. |
-| Suggestions Dock | Auto-detected spike/NAN segments to accept as annotations. |
-| 2D Plot | Multi-channel time-series (overlay or stacked). Selection & interactive cursor. |
+| Suggestions Dock | Auto-detected spike/NaN segments to accept as annotations. |
+| 2D Plot | Multi-channel time-series (overlay or stacked); selection & interactive cursor. |
 | 3D View | Spatial markers + heading arrows + mirrored channel points. |
 
-Annotation Mode: Click start then end (two single clicks) to create, then label dialog appears.
+Annotation Mode: click start then end (two single clicks) to create a segment, then a label dialog appears.
 
 ---
-## 8. Data Handling & Column Classification
-On load:
-- NaN normalization (empty strings, "nan", "NaN" → `np.nan`).
-- Time column detection: prefer `normalized_time` else first column containing "time".
-- Numeric columns → `signal_columns`; non‑numeric → `metadata_columns`.
-- `is_bad_segment` column auto-created if missing.
-- Sample rate inferred from median positive time delta; fallback 120 Hz.
 
-Deletion collapses time: After removing a segment, `normalized_time` is reconstructed as `np.arange(n)/sample_rate` ensuring contiguous time base.
+## 8. Adaptive Ingestion
 
-Channel groups heuristic string matching (`gaze`, `head`, `chest`, `left_foot`, `right_foot`, `chair`, `gmm`). Unmatched go to `Other`.
+`tsdt_core/ingest.py` replaces a bare `pd.read_csv` with detection across several axes:
+
+- **Delimiter & encoding**: sniffed via `csv.Sniffer` and `charset-normalizer` from the file's head bytes.
+- **Time axis**: detected by column name (`time`, `timestamp`, `datetime`, `clock`, `sec`, `millis`, `micros`) and monotonicity, then converted to `normalized_time` (relative seconds):
+  - Epoch magnitude detection distinguishes seconds / milliseconds / microseconds / nanoseconds.
+  - Name hints (`_ms`, `_us`, `millis`, `micros`) override magnitude-based guessing.
+  - ISO-style datetime strings are parsed and converted to relative seconds.
+  - A file that already has `normalized_time` passes through untouched.
+- **Numeric coercion**: text columns that are ≥90% numeric are coerced, with a per-column count of values lost, surfaced in the status bar and the import preview.
+- **Formats**: CSV/TSV (any sniffed delimiter), Parquet, and Feather.
+
+Everything detected is captured in an `IngestReport` (`tsdt_core/ingest.py`). When ingestion made a nontrivial decision, `ImportPreviewDialog` (`dialogs.py`) shows the report, a data preview, and lets you override the time column/unit before the file is adopted — clean, already-normalized files skip the dialog and load directly.
 
 ---
+
 ## 9. Cleaning Operations
-- Delete segment: Hard removal + timeline collapse; recorded with `deleted_samples` count.
-- Mark bad: Set boolean flag; preserves temporal length.
-- Suggestions: Spike detection via derivative threshold mean + 3*std; contiguous indices merged into segments.
-- Annotation drag: Updates underlying segment boundaries live.
+
+- **Delete segment**: hard removal + timeline collapse; recorded with a `deleted_samples` count.
+- **Mark bad**: sets the `is_bad_segment` boolean flag; preserves temporal length.
+- **Suggestions**: spike detection via derivative threshold (mean + 3·std); contiguous indices merged into segments.
+- **Annotation drag**: updates underlying segment boundaries live.
 
 ---
+
 ## 10. Filters & Signal Processing
-Available filter types (`available_filters()`):
+
+Available filter types (`filter_engine.available_filters()`):
 ```
 moving_average, median, savgol, butter_lowpass, butter_bandpass,
 detrend, resample, interpolate, derivative, integrate,
-normalize_zscore, normalize_percent, moving_rms, absolute
+normalize_zscore, normalize_percent, moving_rms, absolute,
+invert_polarity, invert_mean, invert_reference, mirror,
+circular_flip, constant_offset
 ```
-Preview: First selected channel shows side-by-side original vs filtered before committing.
 
-Resample: Linear interpolation of numeric columns to a new uniform grid; updates global sampling rate; non-numeric columns repeat first value.
+Preview: the first selected channel shows original vs. filtered side by side before committing. Filter application runs on a background thread (`background.run_in_background`), so the window stays responsive on large files; a busy dialog's Cancel button detaches the running job.
 
-Fallbacks when SciPy missing:
-- Savitzky–Golay: local polynomial fit fallback.
-- Butterworth filters: replaced with rolling average or simple bandpass approximation (detrend + lowpass).
+Resample: linear interpolation of numeric columns to a new uniform grid; updates the global sampling rate; non-numeric columns repeat their first value.
 
-Derived metrics (plugins) can use expressions (`pd.eval`) referencing existing columns.
+Fallbacks when SciPy is unavailable:
+- Savitzky–Golay → local polynomial fit fallback.
+- Butterworth filters → rolling-average or detrend+lowpass approximations.
 
 ---
+
 ## 11. Annotation Workflow
-Annotations have: `start`, `end`, `label`, `track`, `color`, `id`.
-Context menu: Edit / Delete / Jump.
-Episode overlay: If CSV includes `episode_index`, `episode_type`, optional `episode_state`, segments auto-created with semantic coloring.
-Drag handles modify boundaries; multi-plot clones stay synchronized.
-Autosave ensures annotation persistence.
+
+Annotations (`tsdt_core.models.AnnotationSegment`, Pydantic-validated) have: `start`, `end`, `label`, `track`, `color`, `id`, optional `episode_index`. Unknown fields from newer file versions are tolerated rather than rejected.
+
+Context menu: Edit / Delete / Jump. Episode overlay: if a CSV includes `episode_index`, `episode_type`, optional `episode_state`, segments are auto-created with semantic coloring. Drag handles modify boundaries; multi-plot clones stay synchronized.
 
 ---
+
 ## 12. 2D Plotting Controller
+
 Built on pyqtgraph:
-- Overlay vs stacked mode switch.
-- LinearRegionItem for selection & annotations.
-- Time cursor (InfiniteLine) updated by playback timer or slider.
-- Axis styling for readability.
-- Focus function pans view to keep a segment centered without zoom change.
+- Overlay vs. stacked mode switch.
+- `LinearRegionItem` for selection & annotations.
+- Time cursor (`InfiniteLine`) updated by playback timer or slider.
+- Light/dark background restyling that follows the active theme.
+- Focus function pans the view to keep a segment centered without changing zoom.
 
 ---
+
 ## 13. 3D Visualization & Coordinate Frames
+
 Uses `pyqtgraph.opengl`:
-- Mappings: Body part → `{x,y,z}` column names.
+- Mappings: body part → `{x, y, z}` column names.
 - Each part gets a scatter point + heading arrow (from `<part>_heading_deg`).
-- Fallback star layout when spatial columns absent.
-- Active 2D channels mirrored as peripheral markers (radial layout, height ~ scaled value).
-- Frames: Offsets stored per part; calibration wizard computes mean heading offset between channels over selected window.
+- Fallback star layout when spatial columns are absent.
+- Active 2D channels mirrored as peripheral markers (radial layout, height scaled by value).
+- Frames: offsets stored per part; calibration wizard computes the mean heading offset between channels over a selected window.
 
 ### Frame Transform Utility (Tools → Derived frame transform…)
-Generates a new heading difference channel between a source and target heading with optional user‑specified offset using modular wrap logic:
-
+Generates a new heading-difference channel between a source and target heading with an optional user-specified offset, wrapped to [-180, 180]:
 ```
 new = ((source_heading - target_heading - offset + 180) % 360) - 180
 ```
-This keeps angles in the range [-180, 180]. Useful for relative orientation analyses (e.g., head vs torso, gaze vs chair). The new channel is appended to `signal_columns` and recorded in history as `frame_transform`.
+The new channel is appended to `signal_columns` and recorded in history as `frame_transform`.
 
 ---
+
 ## 14. Projects, Trials, Recipes & Batch Processing
-`ProjectManager` stores:
-- Trials: Path, participant, condition, status, summary.
-- Recipes: Named sequences of operations.
-- Preferences: Default sampling rate, default output directory.
 
-Batch recipe application:
-- Load recipe JSON containing operation history entries.
-- Reapply filter & plugin operations sequentially across selected trials.
-- Output cleaned CSV per trial with `_recipe` suffix.
+`ProjectManager` (Pydantic-validated `TrialEntry`/`Recipe` models) stores:
+- Trials: path, participant, condition, status, summary.
+- Recipes: named sequences of operations.
+- Preferences: default sampling rate, default output directory.
+
+Batch recipe application loads a recipe JSON, reapplies filter & plugin operations sequentially across selected trials, and writes a cleaned CSV per trial with a `_recipe` suffix.
 
 ---
+
 ## 15. Plugins & Derived Channels
+
 Directory `plugins/` (auto-created). Each `.json` file may define:
 ```json
 {
@@ -247,159 +315,227 @@ Directory `plugins/` (auto-created). Each `.json` file may define:
 }
 ```
 - `filter` operation: applied via `FilterEngine.apply`.
-- `derived` operation: `expr` evaluated with `pd.eval`; result appended as new signal column.
+- `derived` operation: `expr` evaluated with `pd.eval` after pattern-based validation (`DANGEROUS_EXPRESSION_PATTERNS` in `main.py`); still runs with full DataFrame access — see `tests/test_plugin_security.py`.
 
-Recipes vs Plugins:
-- Plugin: static spec of transformations.
-- Recipe: captured interactive history (operation records with `description`, `params`, `start`, `end`).
+Recipes vs. plugins: a plugin is a static spec of transformations; a recipe is captured interactive history (`OperationRecord` entries with `description`, `params`, `start`, `end`).
 
 ---
-## 16. Autosave & Session Recovery
-Periodic + event-triggered writes to `.autosave_session.json`, storing:
-- Data (list-form per column)
-- Annotations
-- Deletions
-- History
-Prompt on startup to restore if file detected.
+
+## 16. Session Bundles (.tsdt) & Autosave
+
+`.tsdt` is the native, portable session format — a single ZIP file (`tsdt_core/session_io.py`):
+
+```
+manifest.json      schema/app version, source name, sample rate
+data.arrow         current DataFrame (Arrow/Feather, zstd-compressed)
+original.arrow     pre-edit DataFrame — enables revert & full replay
+annotations.json   annotations, deletions, operation history
+ui_state.json      optional front-end state (theme, layout, ...)
+```
+
+Arrow preserves exact dtypes (unlike a CSV round-trip), writes are atomic (temp file + rename), and bundles from a newer schema version are refused with a clear message rather than silently mis-read. File → Open/Save session (`Ctrl+Shift+S`), or `CoreDataModel.save_session()`/`load_session()` programmatically.
+
+Autosave writes `.autosave_session.tsdt` every 30 seconds and on key events; a restore prompt appears on next launch. Legacy `.autosave_session.json` files from older versions of the app are still detected and restorable.
 
 ---
+
 ## 17. Undo / Redo & Operation History
-Stacks of full state snapshots (DataFrame + annotations + deletions + history).
-Pros: Simplicity, reliability.
-Cons: Memory-heavy for large datasets → consider a future diff-based model.
-History list shows `[description start-end] params` for transparency and recipe generation.
+
+Each mutation pushes only its inverse payload (`tsdt_core/undo.py`) instead of a full DataFrame snapshot:
+
+| Mutation | Undo entry stores |
+|----------|--------------------|
+| Annotate / edit / delete annotation | Nothing but metadata — no frame data. |
+| Mark bad | Previous values of the `is_bad_segment` column. |
+| Filter apply | Previous values of the affected channels only. |
+| Segment delete | The removed contiguous row block + prior time axis. |
+| Rename / delete / duplicate / derive channel | Column names, positions, and data needed to reverse the change. |
+| Resample (or anything non-diffable) | Full DataFrame snapshot (fallback). |
+
+Applying an entry restores the previous state and returns its inverse, so undo and redo are symmetric. A memory cap (`MAX_UNDO_MEMORY_MB`, default 500 MB) and a count cap (`MAX_UNDO_STATES`, default 30) remain as safety valves, but typical entries are kilobytes to a few megabytes rather than a full-frame copy. Benchmark before touching undo paths:
+```bash
+python tools/benchmark_undo.py 1000000 50
+```
+The operation history list shows `[description start–end] params` for transparency and recipe generation.
 
 ---
+
 ## 18. Exporting (Data & Figures)
-- Cleaned CSV: File → Save cleaned CSV…
-- Annotations: JSON schema with `annotations`, `deletions`, `history`, `sample_rate`.
-- Figures: PNG (width scaled by DPI), SVG (vector), PDF (QPdfWriter render of scene).
+
+- Cleaned CSV: File → Save cleaned CSV… (`Ctrl+S`).
+- Session bundle: File → Save session… (`Ctrl+Shift+S`) — the recommended way to preserve full state.
+- Annotations: JSON with `annotations`, `deletions`, `history`, `sample_rate` (File → Save annotations…).
+- Figures: PNG (DPI-scaled), SVG (vector), PDF (`QPdfWriter` render of the scene).
 
 ---
+
 ## 19. Programmatic API Usage
-You can bypass the GUI for scripted pipelines:
+
+`tsdt_core` has no Qt dependency, so you can drive the whole pipeline from a script or notebook:
+
 ```python
-from data_model import DataModel
+from tsdt_core import CoreDataModel
+
+model = CoreDataModel()
+model.load_csv("trial.csv")          # adaptive ingestion runs automatically
+
+df = model.get_dataframe()
 from filter_engine import FilterEngine
-import pandas as pd
-
-model = DataModel()
-model.load_csv("trial.csv")
 engine = FilterEngine(model.sample_rate)
-# Apply smoothing to all signal columns
-df = model.get_dataframe()
 smoothed = engine.apply(df, model.signal_columns, "savgol", {"window": 11, "polyorder": 2})
-model.apply_dataframe(smoothed, "filter", 0.0, smoothed["normalized_time"].max(), {"channels": model.signal_columns, "filter_type": "savgol"})
+model.apply_dataframe(
+    smoothed, "filter", 0.0, smoothed["normalized_time"].max(),
+    {"channels": model.signal_columns, "filter_type": "savgol"},
+)
+
 model.annotate(2.5, 3.0, label="blink", track="eye")
-model.save_clean("trial_clean.csv")
-model.save_annotations("trial_ann.json")
+model.save_session("trial_clean.tsdt")   # portable single-file save
+model.save_clean("trial_clean.csv")      # or a plain CSV export
 ```
-For derived channel creation:
+
+Reload a session headlessly:
 ```python
-df = model.get_dataframe()
-df["gaze_vs_head"] = ((df["gaze_heading_deg"] - df["head_heading_deg"] + 180) % 360) - 180
-model.apply_dataframe(df, "derived:gaze_vs_head", 0.0, df["normalized_time"].max(), {})
+model2 = CoreDataModel()
+ui_state = model2.load_session("trial_clean.tsdt")
 ```
 
----
-## 20. Testing
-Currently limited to `tests/test_filter_engine.py` verifying:
-- Inclusion of new filter names.
-- Correctness of moving RMS and absolute transform.
-Run:
-```powershell
-pytest -q
+For derived-channel creation:
+```python
+model.create_derived_channel(
+    "gaze_vs_head",
+    "((gaze_heading_deg - head_heading_deg + 180) % 360) - 180",
+)
 ```
-Suggested expansion: add integration tests for deletion, annotation persistence, resample correctness, plugin/recipe replay.
+
+The Qt-based GUI (`data_model.DataModel`) exposes the identical API plus `dataChanged`/`annotationsChanged`/`statusMessage`/`historyChanged` signals.
 
 ---
-## 21. Performance Characteristics
+
+## 20. Theming
+
+`theme.apply_theme(app, "System"|"Light"|"Dark")` — reachable via Edit → Preferences → Theme. Uses Qt's Fusion style plus its native color-scheme API (falling back to a hand-built dark palette on platforms where that API has no effect), so no third-party theming dependency is required. The active scheme also restyles the 2D plot background/foreground (`plot2d.set_style(dark=...)`) and persists across restarts.
+
+---
+
+## 21. Testing
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest
+```
+
+~300 tests across:
+- `test_data_model.py` / `test_undo_diff.py` — deletion boundary precision, annotation adjustment, diff-based undo/redo invariants (every operation kind round-tripped with exact-state equality).
+- `test_filter_engine.py` — filter correctness and SciPy-fallback parity.
+- `test_ingest.py` — delimiter/encoding/time-unit detection matrix (epoch s/ms/µs, ISO datetimes, dirty delimiters, Latin-1 encoding, numeric coercion).
+- `test_session_io.py` — `.tsdt` round-trip, dtype preservation, schema-version rejection, malformed-entry tolerance.
+- `test_legacy_formats.py` — pre-modernization JSON formats load forever (frozen fixtures in `tests/fixtures/legacy_formats/`).
+- `test_plugin_security.py` — derived-expression sandboxing.
+- `test_qt_smoke.py` — offscreen construction of `MainWindow` and all 20+ dialogs, plus a pyqtgraph/PySide6 binding guard.
+- `test_background.py`, `test_theme.py` — threading helper and theming behavior.
+
+CI (`.github/workflows/ci.yml`) runs the full suite plus `ruff check` on the headless core modules across Python 3.11 and 3.12.
+
+---
+
+## 22. Packaging & Distribution
+
+- `pyproject.toml` — pinned dependencies, `pip install -e ".[dev]"` for development.
+- `tsdt.spec` — PyInstaller build definition (`pyinstaller tsdt.spec`), verified to produce a runnable onedir bundle.
+- `.github/workflows/build.yml` — builds Linux/Windows/macOS artifacts on manual dispatch, pushes to `main`, and version tags.
+
+---
+
+## 23. Performance Characteristics
+
 | Aspect | Complexity | Notes |
 |--------|------------|-------|
-| Filtering | O(N * C) per operation | Rolling windows & interpolation are vectorized.
-| Resampling | O(N) | Linear interpolation; numeric only.
-| Undo Snapshot | O(N * C) memory | Each action copies full DataFrame (trade-off: simplicity vs memory). |
-| Suggestions | O(N) | Derivative & thresholding on first channel.
-| 3D Update | O(P) | P body parts + active channels radial markers.
+| Filtering | O(N × affected channels) | Vectorized; runs off the UI thread. |
+| Resampling | O(N) | Linear interpolation, numeric columns only; full-snapshot undo path. |
+| Undo (typical op) | O(diff size) | See the table in [§17](#17-undo--redo--operation-history); annotate ≈ 0, filter ≈ one column copy per affected channel. |
+| Undo (fallback) | O(N × C) | Only for non-diffable mutations (resample, unusual scopes). |
+| Session save | ~linear in data size | Arrow/zstd; far faster than the old JSON autosave. |
+| Suggestions | O(N) | Derivative & thresholding on the first channel. |
+| 3D Update | O(P) | P body parts + active channels. |
 
-For very large (> millions samples) datasets, memory may spike due to multiple snapshots.
+Measured on 1M rows × 50 columns (`tools/benchmark_undo.py`): annotate dropped from ~3,000 ms / 380 MB to ~0.2 ms; a single-channel filter apply from ~3,300 ms to ~90 ms; the undo stack after 5 mixed operations from 382 MB (holding one usable entry) to ~20 MB (holding all five).
 
 ---
-## 22. Limitations & Transparency
+
+## 24. Limitations & Transparency
+
 | Limitation | Detail | Potential Mitigation |
 |------------|--------|---------------------|
-| Memory Usage | Full DataFrame copies for undo/redo. | Implement diff or delta stacks; compression. |
-| Limited Tests | Only filter engine tested. | Expand automated test suite. |
-| Plugin Safety | Expressions run with `pd.eval` (no sandbox). | Restrict / validate expressions or run in isolated env. |
 | Artefact Detection | Simple derivative threshold & NaN grouping. | ML or statistical multi-channel detectors. |
-| UI Blocking | Heavy operations run in UI thread. | Move filters / resample to worker threads with progress dialog. |
-| Coordinate Frames | Only heading offset supported. | Hierarchical transforms & quaternion support. |
 | Resample Method | Linear interpolation only. | Offer spline / polyphase resampling. |
-| No Packaging | Pure script; no installer / wheels. | Add `pyproject.toml`, distribute via PyPI. |
-| Missing License | No explicit license file present. | Add OSI-approved license (e.g., MIT). |
-| No Dark Mode Toggle | Hard-coded light style in 2D plot. | Theme abstraction & user preference. |
-| Recipe Semantics | Blind replay; no validation against changed column set. | Schema versioning & compatibility checks. |
+| Coordinate Frames | Only heading offset supported. | Hierarchical transforms & quaternion support. |
+| Plugin Safety | Expressions run via `pd.eval` after pattern-based validation, not a real sandbox. | Restrict / validate further or run in an isolated process. |
+| Recipe Semantics | Blind replay; no validation against a changed column set. | Schema versioning & compatibility checks. |
+| Fallback Undo | Resample and other non-diffable ops still take a full-snapshot cost. | Chunked / lazy snapshotting for these cases. |
+| Data Layer | pandas in-memory only; no out-of-core support for very large files. | Optional Polars/Arrow-native storage (see Roadmap). |
 
-Full transparency: All transformations are in-memory; large chained operations can consume RAM quickly. Deletions irreversibly collapse time (you can undo, but exported data loses original indices).
-
----
-## 23. Suggested Roadmap / Next Steps
-1. Testing: Pytest integration across DataModel operations, annotation editing, autosave restore.
-2. Performance: Introduce diff-based undo (store changesets) & lazy copy on write.
-3. Async Processing: Use `QThreadPool` or `QtConcurrent` for filters & resampling.
-4. Advanced Filtering: Add spectral, wavelet, or adaptive filters; configurable parameter presets.
-5. Plugin Security: Sandboxed evaluation for derived expressions with allowlist of operations.
-6. ML Suggestions: Train classifier for blink/spike/occlusion detection across channels.
-7. 3D Enhancements: Camera controls, part hierarchy, smoothing of trajectories, vector fields.
-8. Export Improvements: Annotation export to common formats (e.g., CSV, ELAN, JSON-LD). Figure style templates & batch figure export.
-9. UI/UX: Dark mode, customizable shortcuts, persistent docking layout.
-10. Packaging: Provide `pyproject.toml`, GitHub Actions CI, cross-platform builds, optional installer.
-11. Metadata Handling: Rich channel metadata & semantic grouping configuration file.
-12. Data Streaming: Support incremental loading & chunked processing of very large trials.
-13. Logging/Audit: Structured log of operations for provenance beyond simple history list.
+Full transparency: all transformations are in-memory; large chained operations still consume RAM proportional to the dataset. Deletions irreversibly collapse time in exported CSVs (undo restores in-session state, but an *exported* cleaned CSV loses original indices — save a `.tsdt` session first if you need to preserve full history).
 
 ---
-## 24. Contributing Guidelines
-Proposed (create a CONTRIBUTING.md):
-- Fork & branch (`feature/<short-name>`).
-- Add/expand tests when touching core logic.
-- Keep GUI responsive (avoid long loops on UI thread—prefer vectorized NumPy operations).
-- Document new plugins with sample JSON inside `plugins/`.
-- Run `pytest` locally before PR.
-- Write clear commit messages (imperative mood): "Add moving RMS filter".
+
+## 25. Roadmap
+
+Tracking the staged modernization plan; items already shipped are noted.
+
+**Shipped**
+- PySide6 port, Pydantic v2 models, adaptive ingestion + import preview, non-blocking CSV load/filtering, Qt-native theming, headless `tsdt_core` extraction, diff-based undo, `.tsdt` session bundles, PyInstaller packaging, CI.
+
+**Planned**
+1. `rerun-py` export (`File → Export to .rrd`) for shareable, replayable sessions outside this app.
+2. Native Polars/Arrow filter execution, with an expression-translation layer so `pd.eval`-based derived channels and recipes keep working.
+3. Optional datashader overview strip for >10M-row files (the interactive plot stays on pyqtgraph).
+4. `tsdt-batch` CLI built on `tsdt_core` for headless recipe application across a folder of trials.
+5. ML-based multi-channel artefact detection to complement the derivative-threshold suggestions.
+6. Richer coordinate-frame transforms (hierarchical, quaternion-based).
 
 ---
-## 25. License
-No license file currently. Until clarified, assume **All Rights Reserved** (limits reuse). Recommendation: adopt MIT or BSD-3-Clause to encourage contribution and academic use.
+
+## 26. Contributing
+
+- Branch per change (`feature/<short-name>`); add or extend tests when touching `tsdt_core` or `filter_engine`.
+- Keep the Qt/headless boundary intact — no Qt imports in `tsdt_core/`.
+- New mutation methods go in `tsdt_core/core.py`, notify via `_notify_*`, push the cheapest sufficient undo entry, and get a round-trip case in `tests/test_undo_diff.py`.
+- New dialogs go in `dialogs.py` and get a construction case in `tests/test_qt_smoke.py`.
+- Run `QT_QPA_PLATFORM=offscreen pytest` and `ruff check` locally before opening a PR.
+- See `CLAUDE.md` for the fuller set of architectural conventions this codebase follows.
 
 ---
-## 26. FAQ / Troubleshooting
+
+## 27. License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## 28. FAQ / Troubleshooting
+
 | Question | Answer |
 |----------|--------|
-| SciPy missing errors? | The app falls back to simpler implementations; install SciPy for best results. |
-| Why sample rate 120 Hz? | Default when inference fails; can change via Preferences. |
-| Deleted segment time jumps? | Timeline is re-collapsed; use mark bad to preserve original duration instead. |
-| Large memory usage after many operations? | Each undo snapshot stores full DataFrame; periodically save & restart or await diff-based undo feature. |
-| 3D view empty? | Provide mappings via Tools → 3D mapping… referencing x,y,z columns. |
-| Plugin not appearing? | Ensure file extension `.json` inside `plugins/` and valid JSON schema with `name`. Reload via Tools → Reload plugins. |
-| Filter preview mismatched lengths? | Preview interpolates originals if resample changed time base; truncates on failure. |
-| Autosave restore failed? | File may be corrupted; delete `.autosave_session.json` and restart. |
+| SciPy missing errors? | The app falls back to pure-NumPy implementations; install SciPy (already a pinned dependency) for the true Butterworth/Savitzky–Golay filters. |
+| Why sample rate 120 Hz? | Fallback default when inference fails (e.g., too few rows); change it via Preferences or check the import preview for a detected time unit. |
+| Deleted segment time jumps? | The timeline is re-collapsed; use Mark Bad instead to preserve original duration. |
+| Large memory usage after many operations? | Undo is diff-based, but the fallback path (e.g., resample) still snapshots the full frame; run `tools/benchmark_undo.py` to check your workload. |
+| 3D view empty? | Provide mappings via Tools → 3D mapping… referencing x, y, z columns. |
+| Plugin not appearing? | Ensure the file has a `.json` extension inside `plugins/` and a valid schema with `name`. Reload via Tools → Reload plugins. |
+| Filter preview mismatched lengths? | Preview interpolates originals if resample changed the time base; truncates on failure. |
+| Autosave restore failed? | The `.tsdt` bundle may be corrupted or from a newer schema version — delete `.autosave_session.tsdt` and restart. |
+| Import preview appeared for a file I expected to load directly? | It only appears when ingestion made a nontrivial decision (odd delimiter/encoding, time-unit conversion, coerced columns) — cancel and fix the source file, or accept the detected settings (they can be overridden in the dialog). |
+| Can I use the engine without the GUI? | Yes — `tsdt_core.CoreDataModel` has no Qt dependency; see [§19](#19-programmatic-api-usage). |
 
 ---
+
 ## Acknowledgements
-Built with PyQt6, pyqtgraph, pandas, numpy, optional SciPy.
 
----
+Built with PySide6, pyqtgraph, pandas, numpy, pydantic, pyarrow, charset-normalizer, and optional SciPy.
+
 ## Disclaimer
+
 This is a research-oriented tool; not validated for clinical or safety-critical use. Always manually verify transformations before publication.
 
 ---
-## Citation (Suggested)
-If you use this tool in academic work, cite the repository and version tag (add tags/releases in future Roadmap).
 
----
-## Versioning
-No formal semantic version yet; recommend adopting `v0.x.y` scheme once roadmap items start landing.
-
----
 Happy annotating & trimming! ✨
