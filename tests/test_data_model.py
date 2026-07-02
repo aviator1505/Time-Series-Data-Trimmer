@@ -558,7 +558,8 @@ class TestRobustAnnotationDeserialization:
                 {},
                 # Missing 'end' - should be skipped
                 {"start": 0.9, "label": "missing_end", "track": "default", "id": 5},
-                # Unknown field should be rejected
+                # Unknown fields are tolerated (forward compatibility with
+                # files written by newer app versions) - loads, field ignored
                 {"start": 0.1, "end": 0.2, "label": "extra_field", "unknown_field": "value"},
             ],
             "deletions": [],
@@ -574,12 +575,16 @@ class TestRobustAnnotationDeserialization:
             # Should not raise an exception
             dm.load_annotations(temp_path)
 
-            # Should have loaded only the valid annotations (those with required fields)
-            # Missing required fields cause TypeError, which is caught and skipped
-            assert len(dm.annotations) == 2
+            # Should have loaded only the annotations with all required fields.
+            # Missing required fields raise ValidationError (a ValueError),
+            # which is caught and skipped. Unknown extra fields are ignored.
+            assert len(dm.annotations) == 3
             labels = [ann.label for ann in dm.annotations]
             assert "valid" in labels
             assert "valid2" in labels
+            assert "extra_field" in labels
+            extra = next(a for a in dm.annotations if a.label == "extra_field")
+            assert not hasattr(extra, "unknown_field")
         finally:
             os.unlink(temp_path)
 

@@ -1411,7 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not path.lower().endswith(".json"):
             path += ".json"
-        data = {"operations": [rec.__dict__ for rec in self.data_model.history]}
+        data = {"operations": [rec.model_dump() for rec in self.data_model.history]}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         self.statusBar().showMessage(f"Recipe saved to {path}")
@@ -2406,9 +2406,9 @@ class MainWindow(QtWidgets.QMainWindow):
             state = {
                 "schema_version": 2,  # Version 2 includes history and sample_rate
                 "data": self.data_model.get_dataframe().to_dict(orient="list") if self.data_model.df is not None else None,
-                "annotations": [ann.__dict__ for ann in self.data_model.annotations],
+                "annotations": [ann.model_dump() for ann in self.data_model.annotations],
                 "deletions": self.data_model.deletions,
-                "history": [rec.__dict__ for rec in self.data_model.history],
+                "history": [rec.model_dump() for rec in self.data_model.history],
                 "sample_rate": self.data_model.sample_rate,
             }
 

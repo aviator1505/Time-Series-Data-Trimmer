@@ -10,26 +10,32 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field
 from PySide6 import QtCore
 
 
-@dataclass
-class AnnotationSegment:
+class AnnotationSegment(BaseModel):
+    """A labeled time segment. Unknown fields from newer file formats are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     start: float
     end: float
     label: str
     track: str = "default"
     color: str = "#4e79a7"
-    id: int = field(default_factory=lambda: uuid.uuid4().int & 0x7FFFFFFF)
+    id: int = Field(default_factory=lambda: uuid.uuid4().int & 0x7FFFFFFF)
     episode_index: int | None = None  # Manual episode index override for CSV export
 
 
-@dataclass
-class OperationRecord:
+class OperationRecord(BaseModel):
+    """One entry in the operation history. Unknown fields are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
     description: str
     params: dict
     start: float
@@ -315,7 +321,7 @@ class DataModel(QtCore.QObject):
 
         self.df = new_df
         self.deletions.append((start, end))
-        self.history.append(OperationRecord("delete_segment", {"deleted_samples": int(deleted_count)}, start, end))
+        self.history.append(OperationRecord(description="delete_segment", params={"deleted_samples": int(deleted_count)}, start=start, end=end))
         # Adjust annotation boundaries to account for collapsed timeline
         self._adjust_annotations_after_deletion(start, end)
         self.dataChanged.emit()
@@ -330,7 +336,7 @@ class DataModel(QtCore.QObject):
         self._push_state()
         mask = (self.df["normalized_time"] >= start) & (self.df["normalized_time"] <= end)
         self.df.loc[mask, "is_bad_segment"] = True
-        self.history.append(OperationRecord("mark_bad", {}, start, end))
+        self.history.append(OperationRecord(description="mark_bad", params={}, start=start, end=end))
         self.dataChanged.emit()
         self.historyChanged.emit()
         self.statusMessage.emit(f"Marked bad {start:.3f}-{end:.3f} s")
@@ -347,7 +353,7 @@ class DataModel(QtCore.QObject):
         ann = AnnotationSegment(start=start, end=end, label=label, track=track, color=color, id=self._id_counter)
         self._id_counter += 1
         self.annotations.append(ann)
-        self.history.append(OperationRecord("annotate", {"label": label, "track": track}, start, end))
+        self.history.append(OperationRecord(description="annotate", params={"label": label, "track": track}, start=start, end=end))
         self.annotationsChanged.emit()
         self.historyChanged.emit()
         self.statusMessage.emit(f"Annotated {start:.3f}-{end:.3f} s as {label}")
@@ -429,9 +435,9 @@ class DataModel(QtCore.QObject):
 
     def save_annotations(self, path: str) -> None:
         data = {
-            "annotations": [ann.__dict__ for ann in self.annotations],
+            "annotations": [ann.model_dump() for ann in self.annotations],
             "deletions": [{"start": s, "end": e} for s, e in self.deletions],
-            "history": [record.__dict__ for record in self.history],
+            "history": [record.model_dump() for record in self.history],
             "sample_rate": self.sample_rate,
         }
         with open(path, "w", encoding="utf-8") as f:
@@ -684,7 +690,7 @@ class DataModel(QtCore.QObject):
         self.df = new_df
         self._classify_columns(new_df)
         self._ensure_bad_mask()
-        self.history.append(OperationRecord(description, params, start, end))
+        self.history.append(OperationRecord(description=description, params=params, start=start, end=end))
         self.dataChanged.emit()
         self.historyChanged.emit()
 
@@ -717,10 +723,10 @@ class DataModel(QtCore.QObject):
         # Record in history for recipe generation
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "rename",
-            {"mappings": mappings},
-            0.0,
-            end_time
+            description="rename",
+            params={"mappings": mappings},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
@@ -750,10 +756,10 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "delete_channels",
-            {"columns": columns},
-            0.0,
-            end_time
+            description="delete_channels",
+            params={"columns": columns},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
@@ -783,10 +789,10 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "duplicate_channels",
-            {"mappings": mappings},
-            0.0,
-            end_time
+            description="duplicate_channels",
+            params={"mappings": mappings},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()
@@ -814,10 +820,10 @@ class DataModel(QtCore.QObject):
         # Record in history
         end_time = self.df["normalized_time"].max() if "normalized_time" in self.df.columns else 0.0
         self.history.append(OperationRecord(
-            "derived",
-            {"name": name, "expr": expr},
-            0.0,
-            end_time
+            description="derived",
+            params={"name": name, "expr": expr},
+            start=0.0,
+            end=end_time
         ))
 
         self.dataChanged.emit()

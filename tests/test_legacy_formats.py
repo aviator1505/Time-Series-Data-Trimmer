@@ -122,6 +122,36 @@ def test_legacy_autosave_v2_restores(model_with_data):
     assert state["sample_rate"] == 120.0
 
 
+def test_serialized_keys_match_legacy_format():
+    """model_dump() must emit exactly the key sets legacy files contain,
+    so files written by this version remain loadable by older versions."""
+    from project_manager import Recipe, TrialEntry
+
+    ann = AnnotationSegment(start=0.0, end=1.0, label="x")
+    assert set(ann.model_dump()) == {
+        "start", "end", "label", "track", "color", "id", "episode_index"
+    }
+
+    op = OperationRecord(description="d", params={}, start=0.0, end=1.0)
+    assert set(op.model_dump()) == {"description", "params", "start", "end"}
+
+    trial = TrialEntry(path="a.csv")
+    assert set(trial.model_dump()) == {
+        "path", "participant", "condition", "status", "summary", "notes",
+        "trial_number", "session", "angle"
+    }
+
+    recipe = Recipe(name="r", operations=[])
+    assert set(recipe.model_dump()) == {"name", "operations"}
+
+
+def test_annotation_coerces_json_types():
+    """JSON-sourced values (e.g. ints where floats are expected) must coerce."""
+    ann = AnnotationSegment(start=1, end=2, label="x", id=5)
+    assert isinstance(ann.start, float)
+    assert ann.model_dump()["start"] == 1.0
+
+
 def test_legacy_annotation_dict_constructs_directly():
     """Raw legacy annotation dicts must construct AnnotationSegment forever."""
     legacy = {
