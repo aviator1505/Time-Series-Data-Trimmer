@@ -767,6 +767,7 @@ class ShortcutDialog(QtWidgets.QDialog):
         self.setWindowTitle("Keyboard Shortcuts")
         layout = QtWidgets.QVBoxLayout(self)
         shortcuts = [
+            ("Ctrl+Shift+S", "Save session (.tsdt)"),
             ("Ctrl+O", "Open CSV"),
             ("Ctrl+S", "Save cleaned CSV"),
             ("Ctrl+Q", "Quit"),

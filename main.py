@@ -674,7 +674,7 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu = menubar.addMenu("&File")
         file_menu.addAction("Open session (.tsdt)…", self.on_open_session)
         act = file_menu.addAction("Save session (.tsdt)…", self.on_save_session)
-        act.setShortcut(QtGui.QKeySequence.StandardKey.Save)
+        act.setShortcut(QtGui.QKeySequence("Ctrl+Shift+S"))
         file_menu.addSeparator()
         act = file_menu.addAction("Open CSV…", self.on_open_csv)
         act.setShortcut(QtGui.QKeySequence("Ctrl+O"))
