@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from tsdt_core.models import AnnotationSegment, OperationRecord
+from tsdt_core.undo import UndoEntry
 
 
 class CoreDataModel:
@@ -51,8 +52,8 @@ class CoreDataModel:
         self.deletions: list[tuple[float, float]] = []
         self.history: list[OperationRecord] = []
         self.sample_rate: float = 120.0
-        self._undo_stack: list[tuple[pd.DataFrame, list[AnnotationSegment], list[tuple[float, float]], list[OperationRecord]]] = []
-        self._redo_stack: list[tuple[pd.DataFrame, list[AnnotationSegment], list[tuple[float, float]], list[OperationRecord]]] = []
+        self._undo_stack: list[UndoEntry] = []
+        self._redo_stack: list[UndoEntry] = []
         self._id_counter: int = 1
         # User preference: whether to preserve timing gaps after deletion
         self.preserve_timing_gaps: bool = False
@@ -154,33 +155,16 @@ class CoreDataModel:
     MAX_UNDO_MEMORY_MB = 500  # Maximum memory for undo stack in MB
 
     def _estimate_undo_memory_mb(self) -> float:
-        """Estimate memory usage of undo stack in MB.
+        """Estimate memory usage of the undo stack in MB.
 
-        Calculates the approximate memory footprint of all DataFrame copies
-        stored in the undo stack. This is used to enforce memory limits and
-        provide user feedback about memory consumption.
-
-        Returns:
-            Estimated memory usage in megabytes.
+        With diff-based entries this is the payload size of each entry
+        (changed columns, deleted row blocks, or a full frame only for
+        fallback snapshots), used to enforce the memory cap.
         """
-        total_bytes = 0
-        for state in self._undo_stack:
-            df, annotations, deletions, history = state
-            # DataFrame memory (deep=True includes object dtype overhead)
-            total_bytes += df.memory_usage(deep=True).sum()
-            # Annotations, deletions, and history are small relative to DataFrames,
-            # but we add a rough estimate for completeness
-            total_bytes += len(annotations) * 200  # ~200 bytes per annotation object
-            total_bytes += len(deletions) * 32  # ~32 bytes per tuple (two floats)
-            total_bytes += len(history) * 300  # ~300 bytes per OperationRecord
-        return total_bytes / (1024 * 1024)
+        return sum(entry.nbytes() for entry in self._undo_stack) / (1024 * 1024)
 
-    def _push_state(self) -> None:
-        if self.df is None:
-            return
-        self._undo_stack.append(
-            (self.df.copy(), list(self.annotations), list(self.deletions), list(self.history))
-        )
+    def _push_entry(self, entry: UndoEntry) -> None:
+        self._undo_stack.append(entry)
         self._redo_stack.clear()
 
         # Prune oldest states if memory exceeds limit
@@ -196,15 +180,66 @@ class CoreDataModel:
         while len(self._undo_stack) > self.MAX_UNDO_STATES:
             self._undo_stack.pop(0)
 
+    def _push_state(self) -> None:
+        """Push a full snapshot (fallback for non-diffable mutations)."""
+        if self.df is None:
+            return
+        self._push_entry(UndoEntry("full", {"df": self.df.copy()}, self))
+
+    def _push_meta(self) -> None:
+        """Push an entry for mutations that touch no frame data."""
+        if self.df is None:
+            return
+        self._push_entry(UndoEntry("meta", {}, self))
+
+    def _push_columns(
+        self,
+        changed: list[str] | None = None,
+        added: list[str] | None = None,
+        removed: list[str] | None = None,
+    ) -> None:
+        """Push a column-level diff: previous values of `changed` columns,
+        names of columns about to be `added` (undo drops them), and data +
+        positions of columns about to be `removed` (undo reinserts them)."""
+        if self.df is None:
+            return
+        df = self.df
+        payload = {
+            "changed": {c: df[c].copy() for c in (changed or []) if c in df.columns},
+            "added": list(added or []),
+            "removed": {
+                c: (int(df.columns.get_loc(c)), df[c].copy())
+                for c in (removed or [])
+                if c in df.columns
+            },
+        }
+        self._push_entry(UndoEntry("columns", payload, self))
+
+    def _push_rows_removed(self, block: pd.DataFrame, position: int) -> None:
+        """Push a row-level diff for a contiguous block about to be deleted."""
+        if self.df is None:
+            return
+        payload = {
+            "slice": block,
+            "position": int(position),
+            "time": self.df["normalized_time"].copy(),
+        }
+        self._push_entry(UndoEntry("rows_insert", payload, self))
+
+    def _push_rename(self, mapping: dict[str, str]) -> None:
+        """Push a rename inverse ({new: old})."""
+        if self.df is None:
+            return
+        self._push_entry(
+            UndoEntry("rename", {"mapping": {v: k for k, v in mapping.items()}}, self)
+        )
+
     def undo(self) -> None:
         if not self._undo_stack:
             self._notify_status("Nothing to undo")
             return
-        if self.df is not None:
-            self._redo_stack.append(
-                (self.df.copy(), list(self.annotations), list(self.deletions), list(self.history))
-            )
-        self.df, self.annotations, self.deletions, self.history = self._undo_stack.pop()
+        entry = self._undo_stack.pop()
+        self._redo_stack.append(entry.apply(self))
         self._notify_data_changed()
         self._notify_annotations_changed()
         self._notify_history_changed()
@@ -214,11 +249,8 @@ class CoreDataModel:
         if not self._redo_stack:
             self._notify_status("Nothing to redo")
             return
-        if self.df is not None:
-            self._undo_stack.append(
-                (self.df.copy(), list(self.annotations), list(self.deletions), list(self.history))
-            )
-        self.df, self.annotations, self.deletions, self.history = self._redo_stack.pop()
+        entry = self._redo_stack.pop()
+        self._undo_stack.append(entry.apply(self))
         self._notify_data_changed()
         self._notify_annotations_changed()
         self._notify_history_changed()
@@ -303,13 +335,22 @@ class CoreDataModel:
         if self.df is None or start >= end:
             self._notify_status("Invalid delete range")
             return
-        self._push_state()
 
         # Use epsilon-tolerant comparison to handle floating-point precision
         time_col = self.df["normalized_time"].values
         in_segment = (time_col >= start - self.TIME_EPSILON) & (time_col <= end + self.TIME_EPSILON)
         mask = ~in_segment
         deleted_count = in_segment.sum()
+
+        # With a monotonic time axis the deleted block is contiguous and a
+        # cheap row-diff suffices; otherwise fall back to a full snapshot.
+        positions = np.flatnonzero(in_segment)
+        if len(positions) > 0 and np.all(np.diff(positions) == 1):
+            self._push_rows_removed(
+                self.df.iloc[positions[0]:positions[-1] + 1].copy(), positions[0]
+            )
+        else:
+            self._push_state()
 
         new_df = self.df.loc[mask].copy().reset_index(drop=True)
 
@@ -343,7 +384,7 @@ class CoreDataModel:
         if self.df is None or start >= end:
             self._notify_status("Invalid mask range")
             return
-        self._push_state()
+        self._push_columns(changed=["is_bad_segment"])
         mask = (self.df["normalized_time"] >= start) & (self.df["normalized_time"] <= end)
         self.df.loc[mask, "is_bad_segment"] = True
         self.history.append(OperationRecord(description="mark_bad", params={}, start=start, end=end))
@@ -355,7 +396,7 @@ class CoreDataModel:
         if self.df is None or start >= end:
             self._notify_status("Invalid annotation range")
             return
-        self._push_state()
+        self._push_meta()
         # Ensure unique ID by finding max existing ID
         if self.annotations:
             max_existing_id = max(a.id for a in self.annotations)
@@ -378,7 +419,7 @@ class CoreDataModel:
         color: str | None,
         episode_index: int | None = None
     ) -> None:
-        self._push_state()  # Capture state before mutation for undo support
+        self._push_meta()  # Capture state before mutation for undo support
         for ann in self.annotations:
             if ann.id == ann_id:
                 ann.start = start
@@ -397,7 +438,7 @@ class CoreDataModel:
                 break
 
     def delete_annotation(self, ann_id: int) -> None:
-        self._push_state()  # Capture state before mutation for undo support
+        self._push_meta()  # Capture state before mutation for undo support
         self.annotations = [a for a in self.annotations if a.id != ann_id]
         self._notify_annotations_changed()
         self._notify_history_changed()
@@ -696,7 +737,21 @@ class CoreDataModel:
         return df[(df["normalized_time"] >= start) & (df["normalized_time"] <= end)].copy()
 
     def apply_dataframe(self, new_df: pd.DataFrame, description: str, start: float, end: float, params: dict) -> None:
-        self._push_state()
+        # Same-length frames with a declared channel list (the filter path)
+        # only need a column diff; anything else (resample, unknown scope)
+        # falls back to a full snapshot.
+        channels = params.get("channels")
+        old = self.df
+        if (
+            old is not None
+            and channels
+            and len(new_df) == len(old)
+            and not (set(old.columns) - set(new_df.columns))
+        ):
+            added = [c for c in new_df.columns if c not in old.columns]
+            self._push_columns(changed=list(channels), added=added)
+        else:
+            self._push_state()
         self.df = new_df
         self._classify_columns(new_df)
         self._ensure_bad_mask()
@@ -713,7 +768,7 @@ class CoreDataModel:
         if not mappings or self.df is None:
             return
 
-        self._push_state()
+        self._push_rename(mappings)
 
         # Apply rename to DataFrame
         self.df.rename(columns=mappings, inplace=True)
@@ -751,7 +806,7 @@ class CoreDataModel:
         if not columns or self.df is None:
             return
 
-        self._push_state()
+        self._push_columns(removed=columns)
 
         # Remove columns from DataFrame (only those that exist)
         cols_to_drop = [c for c in columns if c in self.df.columns]
@@ -784,7 +839,7 @@ class CoreDataModel:
         if not mappings or self.df is None:
             return
 
-        self._push_state()
+        self._push_columns(added=[n for n in mappings.values() if n not in self.df.columns])
 
         # Copy each column
         for source, new_name in mappings.items():
@@ -818,7 +873,12 @@ class CoreDataModel:
         if not name or not expr or self.df is None:
             return
 
-        self._push_state()
+        # A derived channel may overwrite an existing column; store its
+        # previous values in that case, otherwise just record the addition.
+        if name in self.df.columns:
+            self._push_columns(changed=[name])
+        else:
+            self._push_columns(added=[name])
 
         # Evaluate expression
         self.df[name] = pd.eval(expr, local_dict=self.df.to_dict("series"))
