@@ -134,6 +134,7 @@ from plot2d import PlotController2D
 from plot3d import PlotController3D
 from plugin_system import PluginManager
 from project_manager import ProjectManager, load_signal_presets, save_signal_presets, load_ui_state, save_ui_state
+from theme import apply_theme, effective_scheme
 
 
 class ChannelManagerWidget(QtWidgets.QWidget):
@@ -504,6 +505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave_path = os.path.join(os.getcwd(), ".autosave_session.json")
         self.loaded_file_path: str | None = None
         self.plot2d = PlotController2D()
+        self.plot2d.set_style(dark=(effective_scheme(QtWidgets.QApplication.instance()) == "dark"))
         self.plot3d = PlotController3D()
         self.style_panel = ChannelStylePanel(
             {
@@ -910,12 +912,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_preferences(self) -> None:
         dlg = PreferencesDialog(self.data_model.sample_rate, self)
         dlg.output_dir.setText(self.project.preferences.get("default_output_dir", ""))
+        ui_state = load_ui_state()
+        dlg.theme_combo.setCurrentText(ui_state.get("theme", "System"))
         if dlg.exec():
             vals = dlg.values()
             self.data_model.set_sample_rate(vals["fs"])
             self.filter_engine.set_sample_rate(vals["fs"])
             self.project.preferences["default_output_dir"] = vals["output_dir"]
             self.project.save()
+            self.apply_theme_preference(vals["theme"])
+
+    def apply_theme_preference(self, theme: str) -> None:
+        """Apply and persist the theme, restyling plots to match."""
+        app = QtWidgets.QApplication.instance()
+        scheme = apply_theme(app, theme)
+        self.plot2d.set_style(dark=(scheme == "dark"))
+        self.plot2d.refresh_plots()
+        ui_state = load_ui_state()
+        ui_state["theme"] = theme
+        save_ui_state(ui_state)
 
     def on_shortcuts(self) -> None:
         ShortcutDialog(self).exec()
@@ -2508,6 +2523,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    apply_theme(app, load_ui_state().get("theme", "System"))
     pg.setConfigOptions(antialias=True)
     window = MainWindow()
     window.show()

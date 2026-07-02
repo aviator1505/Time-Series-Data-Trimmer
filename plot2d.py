@@ -80,8 +80,13 @@ class PlotController2D:
         self.colorblind_mode: bool = False
         self.set_style()
 
-    def set_style(self) -> None:
-        pg.setConfigOptions(antialias=True, background="w", foreground="k")
+    def set_style(self, dark: bool = False) -> None:
+        if dark:
+            pg.setConfigOptions(antialias=True, background="#2b2b2b", foreground="#dddddd")
+            self.widget.setBackground("#2b2b2b")
+        else:
+            pg.setConfigOptions(antialias=True, background="w", foreground="k")
+            self.widget.setBackground("w")
 
     def set_data(self, df: pd.DataFrame) -> None:
         self.data = df.copy()

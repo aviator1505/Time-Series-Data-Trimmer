@@ -736,8 +736,11 @@ class PreferencesDialog(QtWidgets.QDialog):
         h = QtWidgets.QHBoxLayout()
         h.addWidget(self.output_dir)
         h.addWidget(self.output_btn)
+        self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.addItems(["System", "Light", "Dark"])
         layout.addRow("Default sampling rate", self.fs_spin)
         layout.addRow("Default output", h)
+        layout.addRow("Theme", self.theme_combo)
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
@@ -751,7 +754,11 @@ class PreferencesDialog(QtWidgets.QDialog):
             self.output_dir.setText(path)
 
     def values(self) -> Dict:
-        return {"fs": self.fs_spin.value(), "output_dir": self.output_dir.text()}
+        return {
+            "fs": self.fs_spin.value(),
+            "output_dir": self.output_dir.text(),
+            "theme": self.theme_combo.currentText(),
+        }
 
 
 class ShortcutDialog(QtWidgets.QDialog):
