@@ -3767,3 +3767,117 @@ class DerivedChannelDialog(QtWidgets.QDialog):
             "name": self.name_edit.text().strip(),
             "expr": self.expr_edit.toPlainText().strip(),
         }
+
+
+class ImportPreviewDialog(QtWidgets.QDialog):
+    """Preview of what adaptive ingestion detected, with override controls.
+
+    Shown before a file is adopted when the importer made a nontrivial
+    decision (delimiter/encoding, time-unit conversion, numeric coercion).
+    The user can override the time column and unit; result_frame() returns
+    the frame with overrides applied.
+    """
+
+    PREVIEW_ROWS = 100
+    PREVIEW_COLS = 30
+    UNIT_CHOICES = ["auto", "s", "ms", "us", "ns", "datetime"]
+
+    def __init__(self, df: pd.DataFrame, report, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Import preview — {report.source}")
+        self.resize(820, 560)
+        self._df = df
+        self._report = report
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Detection summary
+        form = QtWidgets.QFormLayout()
+        fmt = report.format
+        if report.delimiter:
+            fmt += f", delimiter {report.delimiter!r}"
+        if report.encoding:
+            fmt += f", {report.encoding}"
+        form.addRow("Format:", QtWidgets.QLabel(fmt))
+        form.addRow("Size:", QtWidgets.QLabel(f"{len(df):,} rows × {len(df.columns)} columns"))
+
+        # Time axis override controls
+        self.time_combo = QtWidgets.QComboBox()
+        self.time_combo.addItem("(none — fixed sample rate)")
+        for col in df.columns:
+            self.time_combo.addItem(str(col))
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.addItems(self.UNIT_CHOICES)
+        if report.time_column and report.time_column in list(df.columns):
+            self.time_combo.setCurrentText(str(report.time_column))
+        if report.time_unit in self.UNIT_CHOICES:
+            self.unit_combo.setCurrentText(report.time_unit)
+        time_row = QtWidgets.QHBoxLayout()
+        time_row.addWidget(self.time_combo, 1)
+        time_row.addWidget(QtWidgets.QLabel("unit:"))
+        time_row.addWidget(self.unit_combo)
+        form.addRow("Time column:", time_row)
+        layout.addLayout(form)
+
+        # Coercion report and notes
+        if report.coerced_columns or report.notes:
+            notes = QtWidgets.QListWidget()
+            notes.setMaximumHeight(90)
+            for col, lost in report.coerced_columns.items():
+                notes.addItem(f"'{col}' converted to numeric ({lost} value(s) lost)")
+            for note in report.notes:
+                if not any(note.startswith(f"Column '{c}'") for c in report.coerced_columns):
+                    notes.addItem(note)
+            layout.addWidget(notes)
+
+        # Data preview
+        table = QtWidgets.QTableWidget()
+        preview = df.iloc[: self.PREVIEW_ROWS, : self.PREVIEW_COLS]
+        table.setRowCount(len(preview))
+        table.setColumnCount(len(preview.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in preview.columns])
+        table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        for i in range(len(preview)):
+            for j, col in enumerate(preview.columns):
+                val = preview.iloc[i, j]
+                table.setItem(i, j, QtWidgets.QTableWidgetItem("" if pd.isna(val) else str(val)))
+        layout.addWidget(table, 1)
+
+        clipped = []
+        if len(df) > self.PREVIEW_ROWS:
+            clipped.append(f"first {self.PREVIEW_ROWS} rows")
+        if len(df.columns) > self.PREVIEW_COLS:
+            clipped.append(f"first {self.PREVIEW_COLS} columns")
+        if clipped:
+            layout.addWidget(QtWidgets.QLabel(f"Preview shows {' and '.join(clipped)}."))
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Load")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _on_accept(self) -> None:
+        from tsdt_core.ingest import apply_time_axis
+
+        column = self.time_combo.currentText()
+        unit = self.unit_combo.currentText()
+        changed = (
+            column != (self._report.time_column or "(none — fixed sample rate)")
+            or (self._report.time_unit or "auto") != unit
+        )
+        if self.time_combo.currentIndex() > 0 and changed:
+            try:
+                self._df = apply_time_axis(self._df, column, unit, report=self._report)
+            except (KeyError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Time axis", f"Cannot use this time axis:\n{exc}"
+                )
+                return
+        self.accept()
+
+    def result_frame(self) -> pd.DataFrame:
+        return self._df

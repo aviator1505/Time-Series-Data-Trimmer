@@ -189,6 +189,47 @@ def _build_normalized_time(df: pd.DataFrame, report: IngestReport) -> pd.DataFra
     return df
 
 
+UNIT_FACTORS = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
+
+
+def apply_time_axis(
+    df: pd.DataFrame, column: str, unit: str = "auto",
+    report: IngestReport | None = None,
+) -> pd.DataFrame:
+    """Rebuild normalized_time from an explicit column/unit choice.
+
+    Used by the import-preview dialog to override the automatic
+    detection. unit is one of "auto", "s", "ms", "us", "ns", "datetime".
+    Updates report in place when given.
+    """
+    if column not in df.columns:
+        raise KeyError(column)
+    col = df[column]
+
+    if unit == "datetime" or pd.api.types.is_datetime64_any_dtype(col):
+        if not pd.api.types.is_datetime64_any_dtype(col):
+            col = pd.to_datetime(col, errors="coerce", format="mixed")
+        seconds, resolved = _seconds_from_datetime(col), "datetime"
+    elif unit == "auto":
+        seconds, resolved = _seconds_from_numeric(column, col)
+        if seconds is None:
+            raise ValueError(f"Column '{column}' cannot be used as a time axis")
+    else:
+        factor = UNIT_FACTORS[unit]
+        vals = col.dropna()
+        if len(vals) < 2:
+            raise ValueError(f"Column '{column}' has too few values for a time axis")
+        seconds, resolved = (col - float(vals.iloc[0])) * factor, unit
+
+    df = df.copy()
+    df["normalized_time"] = seconds
+    if report is not None:
+        report.time_column = column
+        report.time_unit = resolved
+        report.created_normalized_time = True
+    return df
+
+
 def _detect_time_column(df: pd.DataFrame) -> str | None:
     """Pick the best time-axis candidate by name, preferring monotonic ones."""
     named = [

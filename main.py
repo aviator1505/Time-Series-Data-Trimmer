@@ -869,6 +869,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(df: pd.DataFrame) -> None:
             busy.close()
+            report = df.attrs.get("ingest_report")
+            # Confirm with the user whenever ingestion made a nontrivial
+            # decision (delimiter/encoding, time conversion, coercion)
+            if report is not None and (report.summary() or report.notes):
+                from dialogs import ImportPreviewDialog
+
+                dlg = ImportPreviewDialog(df, report, self)
+                if not dlg.exec():
+                    self.statusBar().showMessage("Import cancelled")
+                    return
+                new_df = dlg.result_frame()
+                new_df.attrs["ingest_report"] = report
+                df = new_df
             self.data_model.load_frame(df, path)
             self._after_load(path)
 

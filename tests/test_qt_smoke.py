@@ -146,3 +146,23 @@ def test_dialog_constructs(qtbot, sample_df, factory):
     widget = factory(sample_df)
     qtbot.addWidget(widget)
     assert widget is not None
+
+
+def test_import_preview_dialog_constructs(qtbot, sample_df):
+    from tsdt_core.ingest import IngestReport
+
+    report = IngestReport(
+        source="trial.csv",
+        delimiter=";",
+        encoding="latin-1",
+        time_column="time_ms",
+        time_unit="ms",
+        created_normalized_time=True,
+        coerced_columns={"gaze_x": 2},
+        notes=["Column 'gaze_x': 2 non-numeric value(s) became NaN"],
+    )
+    dlg = dialogs.ImportPreviewDialog(sample_df, report)
+    qtbot.addWidget(dlg)
+    assert dlg.result_frame() is sample_df
+    # unit combo defaults to the detected unit
+    assert dlg.unit_combo.currentText() == "ms"
