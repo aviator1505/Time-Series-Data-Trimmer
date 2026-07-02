@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ingest import smart_read, sniff_csv
+from tsdt_core.ingest import smart_read, sniff_csv
 
 
 def _write(tmp_path, text: str, name: str = "data.csv", encoding: str = "utf-8") -> str:
